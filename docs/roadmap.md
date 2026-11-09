@@ -18,13 +18,10 @@
   variables, atomics, channels, thread-local state or thread results. The
   program exits when `main` returns even if threads are running.
 - **`weak` is limited** to class-typed fields and locals.
-- **No null checks.** Calling a method or reading a field on `null` crashes.
 - **No implicit `super()`.** A subclass `init` must call `super.init(...)` itself; the parent constructor does not run automatically.
 - **Missing return paths** in non-void methods silently return zero.
 - **Single file programs only.** There are no imports or modules.
-- **Objects print as addresses.** There is no `toString`.
 - **Only `public` and `private`.** There is no `protected`, and no package or module level.
-- **No downcasting.** There is no `instanceof` or cast, so an interface or superclass value cannot be turned back into its concrete class.
 - **Interface calls scan a table.** Dispatch through an interface is a linear search per call.
 - **Primitives are not objects.** `int`, `str` and the others have no methods.
 - **Collections are basic.** `List` and `Map` have no literals (`[1, 2]`), sorting, slicing or `Set`. `Map` iteration order is unspecified, objects used as keys compare by identity, and you cannot loop over a `Map` directly.
@@ -33,9 +30,8 @@
 
 ## Planned, in priority order
 
-1. `protected`, `instanceof` and casts, and default methods in interfaces.
-2. Primitives as objects with methods (`"hi".upper()`, `x.toString()`), and a
-   `toString` hook used by `print`.
+1. `protected`, and default methods in interfaces.
+2. Primitives as objects with methods (`"hi".upper()`, `x.toString()`).
 3. List and map literals, `Set[T]`, sorting, direct `Map` iteration, and generic methods.
 4. Exceptions (`try`/`catch`/`throw`).
 5. An explicit-stack drop to avoid deep recursion, and weak parameters and
