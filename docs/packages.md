@@ -17,11 +17,38 @@ default; for a loose file with no manifest, the folder of the entry file). If th
 first word is a package listed in `needs`, the path is looked up inside that
 package instead, and `bring shapes` alone loads `shapes.ql` from its source folder.
 
-- Every class lives in one global namespace. Two modules defining the same class
-  is a compile error naming both files.
+- Without `as`, every class goes into one shared namespace, and two modules
+  defining the same class is a compile error naming both files.
 - A module is loaded once, however many files bring it. Cycles are allowed.
 - A package can only reach the packages it lists in its own `needs`.
 - A name that is both a local module and a dependency is an error, not a guess.
+
+### Giving a module its own name: `bring ... as`
+
+```python
+bring geo2d as flat
+bring geo3d as solid
+
+class Main:
+    static def main():
+        a = new flat.Point(1, 2)           # geo2d's Point
+        b = new solid.Point(3, 4, 5)       # geo3d's Point, no clash
+        pts: List[flat.Point] = [a]
+        if a instanceof flat.Point:
+            print(flat.Point.origin().describe())
+```
+
+With `as NAME`, every class the module declares is called `NAME.Class` outside
+it (types, `new`, static calls, `instanceof`, casts, `catch`, `class X < NAME.Y`,
+generic arguments). Inside the module nothing changes, and the program's own
+classes keep their plain names. For a package, the alias covers all of the modules
+of that package that the first one brings; the packages *it* depends on stay
+unprefixed unless they are brought `as` something too.
+
+- Aliases are program-wide names, not per-file. Two different modules brought as
+  the same alias share one namespace (and clash if they define the same class).
+- A variable with the alias's name wins over the alias inside expressions.
+- A module cannot be brought both with and without an alias in one program.
 
 ## The manifest: `quill.pkg`
 

@@ -247,6 +247,14 @@ class Parser:
             raise CompileError(f"expected {want!r}, found {got!r}", self.tok.line)
         return self.next()
 
+    def dotted_name(self):
+        """A class name, possibly qualified by a module alias: Circle or shapes.Circle."""
+        name = self.expect("NAME").val
+        while self.is_("OP", ".") and self.peek().kind == "NAME":
+            self.next()
+            name += "." + self.next().val
+        return name
+
     # program / classes
     def program(self):
         classes, self.imports = [], []         # imports: [(dotted module path, line)]
@@ -256,8 +264,9 @@ class Parser:
                 path = [self.expect("NAME").val]
                 while self.accept("OP", "."):
                     path.append(self.expect("NAME").val)
+                alias = self.expect("NAME").val if self.accept("KW", "as") else None
                 self.expect("NEWLINE")
-                self.imports.append((".".join(path), t.line))
+                self.imports.append((".".join(path), t.line, alias))
             else:
                 classes.append(self.class_decl())
         return classes
@@ -277,9 +286,9 @@ class Parser:
             self.expect("OP", "]")
         supers = []
         if self.accept("OP", "<"):
-            supers.append(self.expect("NAME").val)
+            supers.append(self.dotted_name())
             while self.accept("OP", ","):
-                supers.append(self.expect("NAME").val)
+                supers.append(self.dotted_name())
         self.expect("OP", ":")
         self.expect("NEWLINE")
         self.expect("INDENT")
@@ -312,7 +321,7 @@ class Parser:
     def type_name(self):
         """A type, written canonically: weak X, List[int], Map[str,List[int]]."""
         weak = "weak " if self.accept("KW", "weak") else ""
-        name = self.expect("NAME").val
+        name = self.dotted_name()
         if self.accept("OP", "["):
             args = [self.type_name()]
             while self.accept("OP", ","):
@@ -385,7 +394,7 @@ class Parser:
                     c = self.next()
                     cls = var = None
                     if self.is_("NAME"):
-                        cls = self.next().val
+                        cls = self.dotted_name()
                         if self.accept("KW", "as"):
                             var = self.expect("NAME").val
                     catches.append(Catch(cls, var, self.block(), line=c.line))
@@ -493,7 +502,7 @@ class Parser:
                 l = Binary(t.val, l, self.add(), line=t.line)
             elif self.is_("KW", "instanceof"):
                 t = self.next()
-                l = InstanceOf(l, self.expect("NAME").val, line=t.line)
+                l = InstanceOf(l, self.dotted_name(), line=t.line)
             else:
                 return l
 
@@ -518,7 +527,7 @@ class Parser:
         e = self.postfix()
         while self.is_("KW", "as"):
             t = self.next()
-            e = Cast(e, self.expect("NAME").val, line=t.line)
+            e = Cast(e, self.dotted_name(), line=t.line)
         return e
 
     def postfix(self):
@@ -563,7 +572,7 @@ class Parser:
                 self.expect("OP", "(")
                 return SuperCall(name, self.args(), line=t.line)
             if t.val == "new":
-                cls = self.expect("NAME").val
+                cls = self.dotted_name()
                 if self.accept("OP", "["):
                     targs = [self.type_name()]
                     while self.accept("OP", ","):
@@ -2471,6 +2480,19 @@ class FuncGen:
             self.release_fresh(v, t)
         return res
 
+    def class_ref(self, e):
+        """The class that a name like Circle or shapes.Circle refers to, unless its
+        first word is a variable."""
+        parts = []
+        while isinstance(e, FieldAccess):
+            parts.append(e.name)
+            e = e.obj
+        if not isinstance(e, Name) or self.lookup(e.id):
+            return None
+        parts.append(e.id)
+        name = ".".join(reversed(parts))
+        return name if name in self.mod.classes else None
+
     def e_Call(self, e):
         c = e.callee
         if isinstance(c, Name):
@@ -2478,8 +2500,9 @@ class FuncGen:
         if not isinstance(c, FieldAccess):
             self.err("only methods and builtins can be called", e)
         # static call: ClassName.method(...)
-        if isinstance(c.obj, Name) and not self.lookup(c.obj.id) and c.obj.id in self.mod.classes:
-            ci = self.mod.classes[c.obj.id]
+        cname = self.class_ref(c.obj)
+        if cname:
+            ci = self.mod.classes[cname]
             mi = self.mod.find_class_method(ci, c.name)
             if not mi or not mi.static:
                 self.err(f"{ci.name} has no static method {c.name}", e)
@@ -2768,16 +2791,62 @@ def compile_source(src):
     return Module(decls).generate()
 
 
-def load_program(entry):
-    """Parse `entry` and every module it brings in; returns all class declarations."""
-    ctx = quillpkg.context_for(entry)
-    decls, seen, origin = [], set(), {}
+def qualify(decls, ns, names):
+    """Rename the classes `names` to ns.NAME everywhere the declarations of an aliased
+    module mention them (types, `new`, static calls, instanceof, casts, catch)."""
+    mp = {n: f"{ns}.{n}" for n in names}
 
-    def visit(path, pkg):
+    def ty(t):
+        weak = "weak " if t.startswith("weak ") else ""
+        base, args = parse_type(t[len(weak):])
+        base = mp.get(base, base)
+        return weak + (f"{base}[{','.join(ty(a) for a in args)}]" if args else base)
+
+    def walk(node):
+        if isinstance(node, list):
+            for x in node:
+                walk(x)
+            return
+        if not isinstance(node, N):
+            return
+        if isinstance(node, ClassDecl):
+            node.name = mp.get(node.name, node.name)
+            node.supers = [ty(t) for t in node.supers]
+        elif isinstance(node, (VarDecl, FieldDecl)):
+            node.type = ty(node.type)
+        elif isinstance(node, MethodDecl):
+            node.params = [(n, ty(t)) for n, t in node.params]
+            node.ret = ty(node.ret)
+        elif isinstance(node, (New, InstanceOf, Cast)):
+            attr = "cls"
+            setattr(node, attr, ty(getattr(node, attr)))
+        elif isinstance(node, Catch) and node.cls:
+            node.cls = ty(node.cls)
+        elif isinstance(node, FieldAccess) and isinstance(node.obj, Name) and node.obj.id in mp:
+            node.obj.id = mp[node.obj.id]          # Circle.make() inside the module
+        for f in dataclasses.fields(node):
+            walk(getattr(node, f.name))
+
+    walk(decls)
+
+
+def load_program(entry):
+    """Parse `entry` and every module it brings in; returns all class declarations.
+    Modules brought with `as NAME` (and the other modules of the same package they
+    bring) have their classes renamed NAME.Class."""
+    ctx = quillpkg.context_for(entry)
+    files, seen = [], {}                      # files: [(path, decls, namespace)]
+
+    def visit(path, pkg, ns, at=(None, 0)):
         real = os.path.realpath(path)
         if real in seen:
+            if seen[real] != ns:
+                was = f"as {seen[real]}" if seen[real] else "without a name"
+                now = f"as {ns}" if ns else "without a name"
+                raise CompileError(f"module {os.path.basename(path)} is brought {now}, but also {was} elsewhere",
+                                   at[1], at[0])
             return
-        seen.add(real)
+        seen[real] = ns
         with open(path, encoding="utf-8") as f:
             src = f.read()
         try:
@@ -2788,18 +2857,29 @@ def load_program(entry):
             raise
         for d in found:
             d.file = path
-            if d.name in origin:
-                raise CompileError(f"class {d.name} is already defined in {origin[d.name]}", d.line, path)
-            origin[d.name] = path
-        decls.extend(found)
-        for name, line in parser.imports:
+        files.append((path, found, ns))
+        for name, line, alias in parser.imports:
             try:
                 target, tpkg = ctx.resolve(pkg, name)
             except quillpkg.PackageError as e:
                 raise CompileError(str(e), line, path)
-            visit(target, tpkg)
+            visit(target, tpkg, alias or (ns if tpkg is pkg else ""), (path, line))
 
-    visit(entry, ctx.package_of(entry))
+    visit(entry, ctx.package_of(entry), "")
+    spaces = {}
+    for _, found, ns in files:
+        if ns:
+            spaces.setdefault(ns, []).extend(d.name for d in found)
+    for path, found, ns in files:
+        if ns:
+            qualify(found, ns, spaces[ns])
+    decls, origin = [], {}
+    for path, found, ns in files:
+        for d in found:
+            if d.name in origin:
+                raise CompileError(f"class {d.name} is already defined in {origin[d.name]}", d.line, path)
+            origin[d.name] = path
+        decls.extend(found)
     return decls, origin
 
 

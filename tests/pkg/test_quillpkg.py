@@ -445,6 +445,25 @@ class CompileTests(Base):
             quill.compile_file(os.path.join(p, "src", "main.ql"))
         self.assertIn("no module `xlib`", cm.exception.msg)
 
+    def test_alias_names_a_whole_package(self):
+        a = self.lib("alpha", ["1.0.0"],
+                     body="bring alpha_util\nclass Alpha:\n    static def hi() -> int:\n        return Util.one()\n")
+        write(os.path.join(a, "src", "alpha_util.ql"), "class Util:\n    static def one() -> int:\n        return 1\n")
+        git(a, "add", "-A")
+        git(a, "commit", "-q", "-m", "util")
+        git(a, "tag", "-f", "v1.0.0")
+        p = self.app([f'needs alpha 1.0 at git "{a}"'])
+        write(os.path.join(p, "src", "main.ql"),
+              "bring alpha as al\nclass Alpha:\n    pass\n\nclass Main:\n    static def main():\n"
+              "        x = new Alpha()\n        print(al.Alpha.hi())\n")
+        q.install(p)
+        ir = quill.compile_file(os.path.join(p, "src", "main.ql"))
+        # the package's classes, including those of its other module, live under the alias
+        self.assertIn('"al.Alpha.hi"', ir)
+        self.assertIn('"al.Util.one"', ir)
+        self.assertIn('@"vtable.Alpha"', ir)        # the program's own Alpha is a different class
+        self.assertIn('@"vtable.al.Alpha"', ir)
+
     def test_ambiguous_name(self):
         x = self.lib("xlib", ["1.0.0"])
         p = self.app([f'needs xlib 1.0 at git "{x}"'])
