@@ -60,7 +60,10 @@ git repositories (versions are tags) or local folders.
   reference counting, threads
 - [Modules and packages](docs/packages.md): `bring`, `quill.pkg`, version
   constraints, the lock file and every package command
-- [Standard library](docs/stdlib.md): `std.math`, `std.random`, `std.stats`
+- [Standard library](docs/stdlib.md): `std.math`, `std.random`, `std.stats`,
+  hashing and encryption (`std.hash`, `std.cipher`, `std.crypto`)
+- [C and C++ libraries](docs/native.md): `quill wrap`, `native` methods, `Buffer`, and the caveats
+- [Under the hood](docs/hood.md): `quill hood` shows layouts, reference counting, native calls and build commands
 - [Roadmap and limitations](docs/roadmap.md)
 
 Examples live in `examples/`. Run the whole test suite, plain and under both

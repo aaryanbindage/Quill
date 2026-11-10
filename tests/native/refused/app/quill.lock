@@ -1,0 +1,5 @@
+# quill.lock: written by `quill install`. Commit it; do not edit it.
+lock 1
+
+pinned nativelib 1.0.0
+    from path ../nativelib

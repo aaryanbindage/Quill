@@ -55,6 +55,54 @@ else
   echo "FAIL tests/modules/ns"; echo "$out" | head -5; fail=1
 fi
 
+# native code: wrap a C library and a C++ library with `quill wrap`, then use them.
+# The program prints "ok"/"FAIL"/"LEAK" lines like the other tests.
+export QUILL_QUIET_NATIVE=1
+nat=$(mktemp -d)
+native_case() {   # name, library module, program, wrap arguments...
+  name=$1; lib=$2; prog=$3; shift 3
+  if $PY quill.py wrap "$@" --out "$nat/$lib.ql" --yes >"$nat/$name.log" 2>&1; then
+    cp "$prog" "$nat/"
+    for san in "" $sans; do
+      if [ "$san" = thread ]; then continue; fi        # TSan cannot link the C++ runtime reliably
+      if [ -n "$san" ]; then flag="--sanitize $san"; else flag=""; fi
+      out=$(ASAN_OPTIONS=detect_leaks=0 $PY quill.py run $flag "$nat/$(basename "$prog")" 2>&1); code=$?
+      if [ $code -ne 0 ] || echo "$out" | grep -qE '^FAIL|^LEAK|ERROR: AddressSanitizer' || ! echo "$out" | grep -q 'no leaks'; then
+        echo "FAIL tests/native/$name [${san:-plain}]"; echo "$out" | head -12; fail=1
+      else
+        echo "pass tests/native/$name [${san:-plain}]"
+      fi
+    done
+  else
+    echo "FAIL tests/native/$name (quill wrap)"; head -20 "$nat/$name.log"; fail=1
+  fi
+}
+native_case c vec tests/native/main.ql tests/native/vec.h --name Vec --source tests/native/vec.c \
+  --prefix vec_ --owns vec=vec_free --free-strings vec_free_string
+if command -v clang++ >/dev/null 2>&1 || command -v g++ >/dev/null 2>&1; then
+  native_case cpp geo tests/native/main_cpp.ql tests/native/counter.hpp --name Geo --source tests/native/counter.cpp
+fi
+# a `needs` dependency that contains native code must be refused
+out=$(cd tests/native/refused/app && $PY ../../../../quill.py run src/main.ql 2>&1); code=$?
+if [ $code -eq 1 ] && echo "$out" | grep -qF 'contains native (C/C++) code'; then
+  echo "pass tests/native/refused"
+else
+  echo "FAIL tests/native/refused (got exit $code)"; echo "$out" | head -3; fail=1
+fi
+# wrapping needs an explicit acknowledgement of the caveats
+if $PY quill.py wrap tests/native/vec.h --out "$nat/x.ql" </dev/null >/dev/null 2>&1; then
+  echo "FAIL tests/native/acknowledge (wrapped without --yes)"; fail=1
+else
+  echo "pass tests/native/acknowledge"
+fi
+# "Under the hood" runs and explains a native program
+if $PY quill.py hood "$nat/main.ql" --only classes,native --no-build 2>&1 | grep -q 'VecRaw.vec_push'; then
+  echo "pass tests/native/hood"
+else
+  echo "FAIL tests/native/hood"; fail=1
+fi
+rm -rf "$nat"
+
 # package manager unit tests (they build real git repositories in a temp folder)
 if command -v git >/dev/null 2>&1; then
   if $PY -m unittest discover -s tests/pkg >/tmp/quill_pkg_tests.txt 2>&1; then

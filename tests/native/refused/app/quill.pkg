@@ -1,0 +1,7 @@
+# a program whose dependency contains native code: `needs` refuses it
+package app
+version 0.1.0
+source src
+start main
+
+needs nativelib 1.0 at path ../nativelib
