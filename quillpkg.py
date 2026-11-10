@@ -780,6 +780,25 @@ class Package:
     version: tuple = (0, 0, 0)
 
 
+STD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "std")
+_std = []
+
+
+def std_package():
+    """The bundled standard library, as one package (the same object every time, so
+    modules of std that bring each other share a namespace)."""
+    if not _std:
+        _std.append(Package("std", STD_DIR, STD_DIR, []))
+    return _std[0]
+
+
+def std_modules():
+    try:
+        return sorted("std." + f[:-3] for f in os.listdir(STD_DIR) if f.endswith(".ql"))
+    except OSError:
+        return []
+
+
 class Context:
     """Maps `bring a.b.c` to a file for the compiler."""
 
@@ -793,6 +812,14 @@ class Context:
         segs = dotted.split(".")
         first = segs[0]
         local = os.path.join(pkg.src, *segs) + ".ql"
+        if first == "std" and first not in pkg.needs and not os.path.exists(local):
+            if len(segs) == 1:
+                raise PackageError("`bring std` needs a module: std.math, std.random or std.stats")
+            target = os.path.join(STD_DIR, *segs[1:]) + ".ql"
+            if not os.path.exists(target):
+                raise PackageError(f"the standard library has no module `{dotted}` "
+                                   f"(available: {', '.join(std_modules())})")
+            return target, std_package()
         if first in pkg.needs:
             dep = self.packages[first]
             if len(segs) == 1:

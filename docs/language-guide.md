@@ -355,6 +355,42 @@ element can be assigned to. `null` elements are allowed for `str` and classes.
 An empty `[]` or `{}` needs a declared type. A literal builds a new `List` or
 `Map`, so a repeated map key keeps its last value.
 
+## Sorting
+
+```python
+xs = [5, 3, 9, 1]
+xs.sort()               # in place, ascending, stable
+xs.sortDesc()           # in place, descending
+ys = xs.sorted()        # a sorted copy; xs is untouched
+xs.isSorted()   xs.reverse()   xs.min()   xs.max()   xs.copy()   xs.addAll(ys)
+```
+
+Lists of `int`, `float`, `str` and `bool` sort natively (strings by byte
+order). A list of objects sorts when the class defines
+`compareTo(self, other: X) -> int`, returning negative, zero or positive.
+Subclasses use their parent's `compareTo`. Sorting a `List[X]` whose element type
+cannot be ordered is a compile error. `min`/`max` of an empty list throw an
+`Error`. `<`, `<=`, `>` and `>=` also work on strings.
+
+## Sets
+
+`Set[T]` holds each value once. Elements compare like `Map` keys: ints, floats,
+strings and bools by value, objects by identity.
+
+```python
+a = {1, 2, 3}                     # Set[int]
+none: Set[str] = {}               # an empty set needs a declared type
+a.add(4)   a.remove(1)   a.has(2)   a.size()   a.isEmpty()   a.clear()
+a.union(b)   a.intersect(b)   a.difference(b)   a.symDiff(b)   # new sets
+a.addAll(b)  a.removeAll(b)   a.retainAll(b)                   # in place
+a.isSubsetOf(b)   a.isSupersetOf(b)   a.isDisjoint(b)   a.equals(b)
+a.items()   a.sortedItems()   a.copy()
+```
+
+`add` and `remove` return whether the set changed. Iteration order is
+unspecified, so loop over `s.sortedItems()` when order matters. `{a, b}` is a
+set and `{k -> v}` is a map.
+
 ## Indexing and `for` loops
 
 - `x[i]` on an `Array` reads an element. On any other class it calls

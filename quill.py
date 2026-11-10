@@ -190,6 +190,10 @@ class ListLit(N): items: list
 @dataclass
 class MapLit(N): keys: list; vals: list
 @dataclass
+class SetLit(N): items: list
+@dataclass
+class RawVal(N): v: str; t: str      # internal: an already evaluated operand
+@dataclass
 class Catch(N): cls: str; var: str; body: list
 @dataclass
 class Throw(N): value: N
@@ -594,15 +598,24 @@ class Parser:
             self.expect("OP", "]")
             return ListLit(items, line=t.line)
         if t.kind == "OP" and t.val == "{":
-            keys, vals = [], []
-            while not self.is_("OP", "}"):
-                keys.append(self.expr())
-                self.expect("OP", "->")
+            if self.accept("OP", "}"):
+                return MapLit([], [], line=t.line)          # {} is an empty map (or set, by context)
+            first = self.expr()
+            if self.is_("OP", "->"):                       # {k -> v, ...} is a map
+                keys, vals = [first], []
+                self.next()
                 vals.append(self.expr())
-                if not self.accept("OP", ","):
-                    break
+                while self.accept("OP", ",") and not self.is_("OP", "}"):
+                    keys.append(self.expr())
+                    self.expect("OP", "->")
+                    vals.append(self.expr())
+                self.expect("OP", "}")
+                return MapLit(keys, vals, line=t.line)
+            items = [first]                                 # {a, b, c} is a set
+            while self.accept("OP", ",") and not self.is_("OP", "}"):
+                items.append(self.expr())
             self.expect("OP", "}")
-            return MapLit(keys, vals, line=t.line)
+            return SetLit(items, line=t.line)
         raise CompileError(f"unexpected {t.val if t.val is not None else t.kind!r}", t.line)
 
 
@@ -630,6 +643,27 @@ INTRINSICS = {
     "__sleep_ms": (["int"], "void", "quill_sleep_ms"),
     "__panic": (["str"], "void", "quill_panic"),
     "__exc_msg": ([], "str", "quill_exc_msg"),
+    "__sqrt": (["float"], "float", "sqrt"),
+    "__sin": (["float"], "float", "sin"),
+    "__cos": (["float"], "float", "cos"),
+    "__tan": (["float"], "float", "tan"),
+    "__asin": (["float"], "float", "asin"),
+    "__acos": (["float"], "float", "acos"),
+    "__atan": (["float"], "float", "atan"),
+    "__exp": (["float"], "float", "exp"),
+    "__log": (["float"], "float", "log"),
+    "__log10": (["float"], "float", "log10"),
+    "__floor": (["float"], "float", "floor"),
+    "__ceil": (["float"], "float", "ceil"),
+    "__round": (["float"], "float", "round"),
+    "__trunc": (["float"], "float", "trunc"),
+    "__fabs": (["float"], "float", "fabs"),
+    "__sinh": (["float"], "float", "sinh"),
+    "__cosh": (["float"], "float", "cosh"),
+    "__tanh": (["float"], "float", "tanh"),
+    "__atan2": (["float", "float"], "float", "atan2"),
+    "__pow": (["float", "float"], "float", "pow"),
+    "__fmod": (["float", "float"], "float", "fmod"),
 }
 
 # Built-in classes, written in Quill and compiled with every program.
@@ -756,6 +790,93 @@ class List[T]:
     def contains(self, x: T) -> bool:
         return self.indexOf(x) >= 0
 
+    def addAll(self, other: List[T]):
+        for i in range(other.size()):
+            self.add(other.get(i))
+
+    def copy(self) -> List[T]:
+        out = new List[T]()
+        out.addAll(self)
+        return out
+
+    def reverse(self):
+        i = 0
+        j = self.count - 1
+        while i < j:
+            t = self.items[i]
+            self.items[i] = self.items[j]
+            self.items[j] = t
+            i += 1
+            j -= 1
+
+    # Ordering: int, float, str and bool compare natively; a class needs a method
+    # compareTo(self, other: Class) -> int (negative, zero or positive).
+    def sort(self):
+        if self.count > 1:
+            self.msort(new Array[T](self.count), 0, self.count)
+
+    def sortDesc(self):
+        self.sort()
+        self.reverse()
+
+    def sorted(self) -> List[T]:
+        out = self.copy()
+        out.sort()
+        return out
+
+    def isSorted(self) -> bool:
+        for i in range(1, self.count):
+            if __less(self.items[i], self.items[i - 1]):
+                return false
+        return true
+
+    def min(self) -> T:
+        if self.count == 0:
+            __panic("min of an empty list")
+        best = self.items[0]
+        for i in range(1, self.count):
+            if __less(self.items[i], best):
+                best = self.items[i]
+        return best
+
+    def max(self) -> T:
+        if self.count == 0:
+            __panic("max of an empty list")
+        best = self.items[0]
+        for i in range(1, self.count):
+            if __less(best, self.items[i]):
+                best = self.items[i]
+        return best
+
+    # stable merge sort of items[lo, hi)
+    private def msort(self, tmp: Array[T], lo: int, hi: int):
+        if hi - lo < 2:
+            return
+        mid = lo + (hi - lo) / 2
+        self.msort(tmp, lo, mid)
+        self.msort(tmp, mid, hi)
+        i = lo
+        j = mid
+        k = lo
+        while i < mid and j < hi:
+            if __less(self.items[j], self.items[i]):
+                tmp[k] = self.items[j]
+                j += 1
+            else:
+                tmp[k] = self.items[i]
+                i += 1
+            k += 1
+        while i < mid:
+            tmp[k] = self.items[i]
+            i += 1
+            k += 1
+        while j < hi:
+            tmp[k] = self.items[j]
+            j += 1
+            k += 1
+        for m in range(lo, hi):
+            self.items[m] = tmp[m]
+
 class MapEntry[K, V]:
     key: K
     value: V
@@ -877,6 +998,105 @@ class Map[K, V]:
     def clear(self):
         self.buckets = new Array[MapEntry[K, V]](16)
         self.count = 0
+
+# A set of distinct values, built on Map. Elements compare like Map keys: numbers
+# and strings by value, objects by identity. Iteration order is unspecified; use
+# sortedItems() for a stable order.
+class Set[T]:
+    private map: Map[T, bool]
+
+    def init(self):
+        self.map = new Map[T, bool]()
+
+    def size(self) -> int:
+        return self.map.size()
+
+    def isEmpty(self) -> bool:
+        return self.map.size() == 0
+
+    def has(self, x: T) -> bool:
+        return self.map.has(x)
+
+    def add(self, x: T) -> bool:
+        if self.map.has(x):
+            return false
+        self.map.put(x, true)
+        return true
+
+    def remove(self, x: T) -> bool:
+        return self.map.remove(x)
+
+    def clear(self):
+        self.map.clear()
+
+    def items(self) -> List[T]:
+        return self.map.keys()
+
+    def sortedItems(self) -> List[T]:
+        out = self.map.keys()
+        out.sort()
+        return out
+
+    def copy(self) -> Set[T]:
+        out = new Set[T]()
+        out.addAll(self)
+        return out
+
+    # in place
+    def addAll(self, other: Set[T]):
+        xs = other.items()
+        for i in range(xs.size()):
+            self.add(xs.get(i))
+
+    def removeAll(self, other: Set[T]):
+        xs = other.items()
+        for i in range(xs.size()):
+            self.remove(xs.get(i))
+
+    def retainAll(self, other: Set[T]):
+        xs = self.items()
+        for i in range(xs.size()):
+            if not other.has(xs.get(i)):
+                self.remove(xs.get(i))
+
+    # new sets
+    def union(self, other: Set[T]) -> Set[T]:
+        out = self.copy()
+        out.addAll(other)
+        return out
+
+    def intersect(self, other: Set[T]) -> Set[T]:
+        out = new Set[T]()
+        xs = self.items()
+        for i in range(xs.size()):
+            if other.has(xs.get(i)):
+                out.add(xs.get(i))
+        return out
+
+    def difference(self, other: Set[T]) -> Set[T]:
+        out = self.copy()
+        out.removeAll(other)
+        return out
+
+    def symDiff(self, other: Set[T]) -> Set[T]:
+        return self.difference(other).union(other.difference(self))
+
+    # comparisons
+    def isSubsetOf(self, other: Set[T]) -> bool:
+        xs = self.items()
+        for i in range(xs.size()):
+            if not other.has(xs.get(i)):
+                return false
+        return true
+
+    def isSupersetOf(self, other: Set[T]) -> bool:
+        return other.isSubsetOf(self)
+
+    def isDisjoint(self, other: Set[T]) -> bool:
+        return self.intersect(other).isEmpty()
+
+    def equals(self, other: Set[T]) -> bool:
+        return self.size() == other.size() and self.isSubsetOf(other)
 """
 
 RUNTIME = r'''
@@ -896,6 +1116,27 @@ declare i32 @pthread_mutex_destroy(ptr)
 declare i32 @usleep(i32)
 declare i32 @dprintf(i32, ptr, ...)
 declare void @exit(i32)
+declare double @sqrt(double)
+declare double @sin(double)
+declare double @cos(double)
+declare double @tan(double)
+declare double @asin(double)
+declare double @acos(double)
+declare double @atan(double)
+declare double @exp(double)
+declare double @log(double)
+declare double @log10(double)
+declare double @floor(double)
+declare double @ceil(double)
+declare double @round(double)
+declare double @trunc(double)
+declare double @fabs(double)
+declare double @sinh(double)
+declare double @cosh(double)
+declare double @tanh(double)
+declare double @atan2(double, double)
+declare double @pow(double, double)
+declare double @fmod(double, double)
 
 ; Every heap value (object or string) has a 16-byte header before the pointer
 ; we hand out: [strong count i64][weak count i64]. All count updates are
@@ -1177,7 +1418,7 @@ define void @quill_sleep_ms(i64 %ms) {
 '''
 
 RUNTIME += "\n" + cstr("@.fmt.panic", "error: %s\n") + "\n" + \
-    cstr("@.fmt.index", "index %ld out of range (length %ld)") + "\n" + \
+    cstr("@.fmt.index", "index %lld out of range (length %lld)") + "\n" + \
     cstr("@.fmt.uncaught", "error: uncaught exception: %s\n") + "\n" + \
     cstr("@.fmt.uncaught0", "error: uncaught exception\n") + "\n"
 
@@ -2174,7 +2415,7 @@ class FuncGen:
 
     def expr_want(self, e, want):
         """Evaluate e; a list or map literal takes its element types from `want`."""
-        if want is not None and isinstance(e, (ListLit, MapLit)):
+        if want is not None and isinstance(e, (ListLit, MapLit, SetLit)):
             return getattr(self, "e_" + type(e).__name__)(e, want)
         return self.expr(e)
 
@@ -2202,6 +2443,58 @@ class FuncGen:
                 return cand
         self.err(f"the {what}'s elements have no common type; declare the type you want", node)
 
+    def e_RawVal(self, e):
+        return e.v, e.t
+
+    def orderable(self, t):
+        if t in ("int", "float", "str", "bool"):
+            return True
+        ci = self.mod.classes.get(t)
+        mi = self.mod.find_method(ci, "compareTo") if ci else None
+        return bool(mi and not mi.static and len(mi.params) == 1 and mi.ret == "int"
+                    and self.assignable(t, mi.params[0][1]))
+
+    def less(self, av, at, bv, bt, node):
+        """An i1: does a sort before b? Numbers, strings and bools compare natively;
+        objects need a compareTo(other) -> int method."""
+        if at in NUM and bt in NUM:
+            if "float" in (at, bt):
+                return self.op(f"fcmp olt double {self.coerce(av, at, 'float', node)}, {self.coerce(bv, bt, 'float', node)}")
+            return self.op(f"icmp slt i64 {av}, {bv}")
+        if at == bt == "str":
+            r = self.op(f"icmp slt i32 {self.op(f'call i32 @strcmp(ptr {av}, ptr {bv})')}, 0")
+            self.release_fresh(av, at); self.release_fresh(bv, bt)
+            return r
+        if at == bt == "bool":
+            return self.op(f"icmp ult i1 {av}, {bv}")
+        if self.mod.is_class(at) and self.orderable(at) and self.assignable(bt, at):
+            r, _ = self.call_method(av, at, "compareTo", [RawVal(bv, bt, line=node.line)], node)
+            return self.op(f"icmp slt i64 {r}, 0")
+        # reached only from library code compiled for a type that cannot be ordered;
+        # user code that sorts such a list is rejected at compile time
+        self.emit(f"call void @quill_panic(ptr {self.mod.string(f'cannot order {at} values: give the class a compareTo method')})")
+        self.raise_pending()
+        return "false"
+
+    def e_SetLit(self, e, want=None):
+        et = None
+        if want and parse_type(want)[0] == "Set":
+            et = parse_type(want)[1][0]
+        vals = [self.expr_want(x, et) for x in e.items]
+        if et is None:
+            et = self.common_type([t for _, t in vals], e, "set")
+            if et is None:
+                self.err("cannot tell what this set holds; declare the variable's type", e)
+        name = f"Set[{et}]"
+        self.mod.instantiate(name, e.line)
+        st, _ = self.e_New(New(name, [], line=e.line))
+        add = self.mod.find_method(self.mod.classes[name], "add")
+        for (v, t), x in zip(vals, e.items):
+            cv = self.coerce(v, t, et, x, "set element")
+            self.emit(f"call i1 {add.symbol}(ptr {st}, {self.mod.llty(et)} {cv})")
+            self.release_fresh(v, t)
+        return st, name
+
     def e_ListLit(self, e, want=None):
         et = None
         if want and parse_type(want)[0] == "List":
@@ -2222,6 +2515,8 @@ class FuncGen:
         return lst, name
 
     def e_MapLit(self, e, want=None):
+        if not e.keys and want and parse_type(want)[0] == "Set":
+            return self.e_SetLit(SetLit([], line=e.line), want)       # {} where a set is expected
         kt = vt = None
         if want and parse_type(want)[0] == "Map":
             kt, vt = parse_type(want)[1]
@@ -2312,6 +2607,12 @@ class FuncGen:
                 return self.op(f"fcmp {p} double {lv}, {rv}"), "bool"
             p = {"<": "slt", "<=": "sle", ">": "sgt", ">=": "sge", "==": "eq", "!=": "ne"}[op]
             return self.op(f"icmp {p} i64 {lv}, {rv}"), "bool"
+        if lt == rt == "str" and op not in ("==", "!="):
+            c = self.op(f"call i32 @strcmp(ptr {lv}, ptr {rv})")
+            p = {"<": "slt", "<=": "sle", ">": "sgt", ">=": "sge"}[op]
+            r = self.op(f"icmp {p} i32 {c}, 0")
+            self.release_fresh(lv, lt); self.release_fresh(rv, rt)
+            return r, "bool"
         if op not in ("==", "!="):
             self.err(f"cannot order {lt} and {rt}", e)
         p = "eq" if op == "==" else "ne"
@@ -2522,6 +2823,12 @@ class FuncGen:
         if mi.static:
             self.err(f"{name} is static; call it as {mi.owner}.{name}(...)", node)
         self.check_access(mi, node)
+        if (ot.startswith("List[") and name in ("sort", "sortDesc", "sorted", "min", "max", "isSorted")
+                and "[" not in self.ci.name):
+            et = parse_type(ot)[1][0]
+            if not self.orderable(et):
+                self.err(f"cannot order {et}: sorting needs numbers or strings, or a class with "
+                         f"compareTo(other: {et}) -> int", node)
         self.null_check(ov, f"null pointer dereference (calling {name})")
         res = self.call_args(mi, ov, args, node, recv_ci=ci,
                              virtual=(not mi.is_iface) and name in ci.vtable,
@@ -2661,13 +2968,17 @@ class FuncGen:
                 v, t = self.expr(a)
                 if k == "int" and t == "int":
                     vals.append(f"i64 {v}")
+                elif k == "float" and t in NUM:
+                    vals.append(f"double {self.coerce(v, t, 'float', a)}")
                 elif k == "str" and t == "str":
                     vals.append(f"ptr {v}")
                 elif k == "obj" and self.mod.is_class(t):
                     vals.append(f"ptr {self.consume(v, t)}")   # ownership moves to the callee
                 else:
                     self.err(f"bad argument to {name}: {t}", a)
-            call = f"call {'i64' if ret == 'int' else 'ptr' if ret == 'str' else 'void'} @{fn}({', '.join(vals)})"
+            call = f"call {'i64' if ret == 'int' else 'ptr' if ret == 'str' else 'double' if ret == 'float' else 'void'} @{fn}({', '.join(vals)})"
+            if ret == "float":
+                return self.op(call), "float"
             if ret == "str":
                 r = self.op(call)
                 self.fresh[r] = "str"       # the runtime hands over an owned string
@@ -2678,6 +2989,9 @@ class FuncGen:
             if fn == "quill_panic":
                 self.raise_pending()
             return None, "void"
+        if name == "__less" and len(e.args) == 2:
+            (av, at), (bv, bt) = self.expr(e.args[0]), self.expr(e.args[1])
+            return self.less(av, at, bv, bt, e), "bool"
         if name == "hash" and len(e.args) == 1:
             v, t = self.expr(e.args[0])
             if t == "int": r = v
@@ -2696,7 +3010,7 @@ class FuncGen:
                 return v, t
             if t in ("int", "float"):
                 buf = self.op("call ptr @quill_alloc(i64 40)")
-                fmt, arg = ("%ld", f"i64 {v}") if t == "int" else ("%g", f"double {v}")
+                fmt, arg = ("%lld", f"i64 {v}") if t == "int" else ("%g", f"double {v}")
                 self.emit(f"call i32 (ptr, i64, ptr, ...) @snprintf(ptr {buf}, i64 40, ptr {self.mod.string(fmt)}, {arg})")
                 self.fresh[buf] = "str"
                 return buf, "str"
@@ -2768,7 +3082,7 @@ class FuncGen:
         for i, a in enumerate(e.args):
             v, t = self.expr(a)
             if i: pf(" ")
-            if t == "int": pf("%ld", ("i64", v))
+            if t == "int": pf("%lld", ("i64", v))
             elif t == "float": pf("%g", ("double", v))
             elif t == "str":
                 pf("%s", ("ptr", self.op(f"select i1 {self.op(f'icmp eq ptr {v}, null')}, ptr {self.mod.string('null')}, ptr {v}")))
@@ -2863,7 +3177,10 @@ def load_program(entry):
                 target, tpkg = ctx.resolve(pkg, name)
             except quillpkg.PackageError as e:
                 raise CompileError(str(e), line, path)
-            visit(target, tpkg, alias or (ns if tpkg is pkg else ""), (path, line))
+            # an alias also covers the other modules of the same package it brings, except
+            # in the standard library, whose modules are independent of each other
+            inherit = ns if tpkg is pkg and pkg.name != "std" else ""
+            visit(target, tpkg, alias or inherit, (path, line))
 
     visit(entry, ctx.package_of(entry), "")
     spaces = {}
@@ -2963,7 +3280,7 @@ def build(path, out, opt="-O1", keep_ll=False, sanitize=None):
             sys.exit(2)
         r = build_windows(ll, out, opt)
     else:
-        r = subprocess.run(["clang", opt, *flags, "-Wno-override-module", ll, "-o", out],
+        r = subprocess.run(["clang", opt, *flags, "-Wno-override-module", ll, "-o", out, "-lm"],
                            capture_output=True, text=True)
     if not keep_ll:
         os.unlink(ll)

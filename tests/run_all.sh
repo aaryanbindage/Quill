@@ -41,7 +41,7 @@ for t in tests/panics/*.ql; do
 done
 # a project made of three packages: the output must match expected.txt
 out=$($PY quill.py run tests/modules/app/src/main.ql 2>&1 | tr -d '\r')
-if [ "$out" = "$(cat tests/modules/app/expected.txt)" ]; then
+if [ "$out" = "$(tr -d '\r' < tests/modules/app/expected.txt)" ]; then
   echo "pass tests/modules/app"
 else
   echo "FAIL tests/modules/app"; echo "$out" | head -5; fail=1
@@ -49,7 +49,7 @@ fi
 
 # modules under different names: the output must match expected.txt
 out=$($PY quill.py run tests/modules/ns/main.ql 2>&1 | tr -d '\r')
-if [ "$out" = "$(cat tests/modules/ns/expected.txt)" ]; then
+if [ "$out" = "$(tr -d '\r' < tests/modules/ns/expected.txt)" ]; then
   echo "pass tests/modules/ns"
 else
   echo "FAIL tests/modules/ns"; echo "$out" | head -5; fail=1
