@@ -26,6 +26,7 @@
 - **Interface calls scan a table.** Dispatch through an interface is a linear search per call.
 - **Primitives are not objects.** `int`, `str` and the others have no methods.
 - **Collections are basic.** `List` has no slicing. `Map` and `Set` iteration order is unspecified, objects used as keys or set elements compare by identity, you cannot loop over a `Map` or `Set` directly (use `keys()`, `values()` or `items()`), and sets have no operators (`a.union(b)`, not `a | b`).
+- **Native code is unchecked.** `quill wrap` covers plain C and a simple C++ subset (no templates, STL containers, operators, callbacks, structs by value or output parameters), the compiler trusts the declared C signature, and `bring`/`needs` cannot fetch native libraries. See docs/native.md.
 - **Generics are template-style.** Every method of an instantiated generic is compiled for that type, there are no constraints on type parameters, no generic methods on ordinary classes, and no static calls on generic classes. Code size grows with the number of instantiations.
 
 ## Planned, in priority order

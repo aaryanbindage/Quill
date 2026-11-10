@@ -20,7 +20,7 @@ class Main:
 - `#` starts a comment. Newlines inside `( )` are ignored.
 - Strings use double quotes with escapes `\n \t \r \0 \\ \"`.
 - Keywords: `class def static return if elif else while for in new self true
-  false null and or not break continue pass weak
+  false null and or xor not break continue pass weak
   public private abstract interface super instanceof as try catch finally throw bring`.
 
 ## Types
@@ -45,7 +45,7 @@ else needs an explicit `int(x)` or `float(x)`.
 x: int = 5          # annotated
 y = 2.5             # type inferred from the first assignment
 z: str              # declared, zero-initialised (0, 0.0, false, null)
-x += 1              # += -= *= /= %=
+x += 1              # += -= *= /= %= &= |= ^= <<= >>= >>>=
 ```
 
 Variables are block scoped. Redeclaring a name that is already visible in an
@@ -56,15 +56,33 @@ enclosing scope is an error (no shadowing).
 Lowest to highest precedence:
 
 1. `or`
-2. `and` (both short-circuit)
-3. `not`
-4. `==  !=  <  <=  >  >=`
-5. `+  -`
-6. `*  /  %`
-7. unary `-`
-8. `.field`, `.method(...)`, calls
+2. `xor`
+3. `and` (`or` and `and` short-circuit)
+4. `not`
+5. `==  !=  <  <=  >  >=`
+6. `|`
+7. `^`
+8. `&`
+9. `<<  >>  >>>`
+10. `+  -`
+11. `*  /  %`
+12. unary `-` and `~`
+13. `.field`, `.method(...)`, calls
 
 Notes:
+
+- **Bitwise operators** work on `int`: `&` and, `|` or, `^` xor, `~` not,
+  `<<` shift left, `>>` arithmetic shift right (keeps the sign), `>>>` logical
+  shift right (fills with zeros). A shift by a count outside 0..63 is defined:
+  the result is 0 (or the sign bits for `>>`). They bind tighter than
+  comparisons, as in Python, so `x & 1 == 0` means `(x & 1) == 0`.
+- **`xor`** is the logical exclusive or on `bool`. Unlike `and`/`or` it
+  evaluates both sides. `&`, `|` and `^` also accept two `bool`s and likewise
+  evaluate both sides. `1 xor 2` is an error; use `1 ^ 2`.
+- Integer literals can be written `0xFF` or `0b1010`, with `_` as a separator
+  (`0xDEAD_BEEF`). A hex or binary literal up to 64 bits is allowed and wraps as
+  two's complement: `0xFFFFFFFFFFFFFFFF` is `-1`.
+- `int` arithmetic wraps on overflow.
 
 - `/` and `%` on two `int`s are integer operations (truncating division).
   If either side is `float`, the operation is done in floating point.
@@ -602,6 +620,21 @@ finally:
 When several `try` blocks are left at once, their `finally` blocks run
 innermost first. A `return` or `throw` inside `finally` replaces whatever was
 in flight.
+
+## Native code
+
+A method can be bound to a C function, and `quill wrap` generates such bindings from a
+header, so your code never handles a pointer:
+
+```python
+native link "m"                       # -lm
+class Fast:
+    native static def hypot(a: float, b: float) -> float = "hypot(double, double) -> double"
+```
+
+Native code is outside what the compiler can check and `bring`/`needs` cannot fetch
+it. Read [native.md](native.md) for the caveats, the wrapper tool and `Buffer`, and use
+`quill hood` ([hood.md](hood.md)) to see how each call is converted.
 
 ## Errors
 

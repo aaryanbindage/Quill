@@ -25,7 +25,7 @@ class Main:
 
 Requires Python 3 and `clang` (no other dependencies). On Windows it also needs
 `gcc` from a MinGW-w64 toolchain (such as w64devkit or winlibs) on `PATH`, which
-links the program; `--sanitize` is not available there.
+links the program. The real sanitizers need Linux or macOS; on Windows `--sanitize address` runs Quill's built-in memory checker instead (`--check`, see docs/check.md).
 
 ```
 python3 quill.py run   file.ql            # compile and run
@@ -37,7 +37,7 @@ With no file name, `run`, `build` and `emit` use the current project's `start`
 module (see below).
 
 Add `--keep-ll` to `build` to keep the generated `.ll` file next to the output,
-or `--sanitize address|thread` to build with a sanitizer.
+or `--sanitize address|thread` to build with a sanitizer, or `--check` for Quill's built-in memory checker (any platform, including Windows).
 
 ## Projects and packages
 
@@ -60,7 +60,11 @@ git repositories (versions are tags) or local folders.
   reference counting, threads
 - [Modules and packages](docs/packages.md): `bring`, `quill.pkg`, version
   constraints, the lock file and every package command
-- [Standard library](docs/stdlib.md): `std.math`, `std.random`, `std.stats`
+- [Standard library](docs/stdlib.md): `std.math`, `std.random`, `std.stats`,
+  hashing and encryption (`std.hash`, `std.cipher`, `std.crypto`)
+- [C and C++ libraries](docs/native.md): `quill wrap`, `native` methods, `Buffer`, and the caveats
+- [Under the hood](docs/hood.md): `quill hood` shows layouts, reference counting, native calls and build commands
+- [Memory checker](docs/check.md): `--check`, leak, double-free and overflow detection on every platform
 - [Roadmap and limitations](docs/roadmap.md)
 
 Examples live in `examples/`. Run the whole test suite, plain and under both

@@ -11,11 +11,13 @@ import copy
 import dataclasses
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 import quillpkg
 from dataclasses import dataclass, field
@@ -29,10 +31,12 @@ class CompileError(Exception):
 
 # ───────────────────────────── Lexer ─────────────────────────────
 
+NATIVE_DIRECTIVES = ("link", "libdir", "include", "source", "flag")
+
 KEYWORDS = {
     "class", "def", "static", "return", "if", "elif", "else",
     "while", "for", "in", "new", "self", "true", "false", "null", "and",
-    "or", "not", "break", "continue", "pass", "weak",
+    "or", "xor", "not", "break", "continue", "pass", "weak",
     "public", "private", "abstract", "interface", "super", "instanceof", "as",
     "try", "catch", "finally", "throw", "bring",
 }
@@ -40,11 +44,12 @@ KEYWORDS = {
 TOKEN_RE = re.compile(r'''
     (?P<WS>[ \t]+) |
     (?P<COMMENT>\#[^\n]*) |
+    (?P<RADIX>0[xX][0-9a-fA-F_]+|0[bB][01_]+) |
     (?P<FLOAT>\d+\.\d+) |
     (?P<INT>\d+) |
     (?P<STR>"(?:[^"\\\n]|\\.)*") |
     (?P<NAME>[A-Za-z_]\w*) |
-    (?P<OP>->|==|!=|<=|>=|\+=|-=|\*=|/=|%=|[-+*/%<>=(),.:{}\[\]])
+    (?P<OP>->|==|!=|>>>=|<<=|>>=|>>>|<<|>>|<=|>=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|[-+*/%<>=&|^~(),.:{}\[\]])
 ''', re.X)
 
 ESCAPES = {"n": "\n", "t": "\t", "\\": "\\", '"': '"', "0": "\0", "r": "\r"}
@@ -105,6 +110,14 @@ def lex(src):
                 continue
             if kind == "INT":
                 toks.append(Tok("INT", int(text), lineno))
+            elif kind == "RADIX":
+                digits = text.replace("_", "")
+                v = int(digits, 16 if digits[1] in "xX" else 2)
+                if v >= 1 << 64:
+                    raise CompileError("integer literal does not fit in 64 bits", lineno)
+                if v >= 1 << 63:           # 0xFFFFFFFFFFFFFFFF is -1, as in two's complement
+                    v -= 1 << 64
+                toks.append(Tok("INT", v, lineno))
             elif kind == "FLOAT":
                 toks.append(Tok("FLOAT", float(text), lineno))
             elif kind == "STR":
@@ -209,6 +222,7 @@ class FieldDecl(N): name: str; type: str; access: str
 @dataclass
 class MethodDecl(N):
     name: str; params: list; ret: str; static: bool; body: list; access: str; abstract: bool
+    native: str = None        # `= "symbol(ctype, ...) -> ctype"` for a method implemented in C
 @dataclass
 class ClassDecl(N):
     name: str; supers: list; fields: list; methods: list; abstract: bool; interface: bool
@@ -262,8 +276,14 @@ class Parser:
     # program / classes
     def program(self):
         classes, self.imports = [], []         # imports: [(dotted module path, line)]
+        self.natives = []                      # native directives: [(kind, value, line)]
         while not self.is_("EOF"):
-            if self.is_("KW", "bring"):
+            if self.is_("NAME", "native") and self.peek().kind == "NAME" and self.peek().val in NATIVE_DIRECTIVES:
+                t = self.next()
+                kind = self.next().val
+                self.natives.append((kind, self.expect("STR").val, t.line))
+                self.expect("NEWLINE")
+            elif self.is_("KW", "bring"):
                 t = self.next()
                 path = [self.expect("NAME").val]
                 while self.accept("OP", "."):
@@ -302,7 +322,8 @@ class Parser:
                 self.expect("NEWLINE")
                 continue
             line, mods = self.tok.line, {}
-            while self.is_("KW") and self.tok.val in ("public", "private", "static", "abstract"):
+            while (self.is_("KW") and self.tok.val in ("public", "private", "static", "abstract")) or \
+                    (self.is_("NAME", "native") and self.peek().kind == "KW"):
                 m = self.next().val
                 key = "access" if m in ("public", "private") else m
                 if key in mods:
@@ -353,6 +374,13 @@ class Parser:
                 break
         self.expect("OP", ")")
         ret = self.type_name() if self.accept("OP", "->") else "void"
+        if mods.get("native"):
+            if not static or abstract or in_interface:
+                raise CompileError("native methods must be static", t.line)
+            self.expect("OP", "=")
+            sig = self.expect("STR").val
+            self.expect("NEWLINE")
+            return MethodDecl(name, params, ret, static, None, mods.get("access", "public"), False, native=sig, line=t.line)
         if abstract:
             if self.is_("OP", ":"):
                 raise CompileError("abstract and interface methods have no body", self.tok.line)
@@ -451,13 +479,13 @@ class Parser:
             self.expect("NEWLINE")
             return [VarDecl(t.val, ty, init, line=t.line)]
         e = self.expr()
-        if self.is_("OP") and self.tok.val in ("=", "+=", "-=", "*=", "/=", "%="):
+        if self.is_("OP") and self.tok.val in ("=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", ">>>="):
             op = self.next().val
             if not isinstance(e, (Name, FieldAccess, Index)):
                 raise CompileError("invalid assignment target", t.line)
             v = self.expr()
             if op != "=":
-                v = Binary(op[0], e, v, line=t.line)
+                v = Binary(op[:-1], e, v, line=t.line)
             self.expect("NEWLINE")
             return [Assign(e, v, line=t.line)]
         self.expect("NEWLINE")
@@ -479,10 +507,17 @@ class Parser:
         return self.or_()
 
     def or_(self):
-        l = self.and_()
+        l = self.xor_()
         while self.is_("KW", "or"):
             t = self.next()
-            l = Binary("or", l, self.and_(), line=t.line)
+            l = Binary("or", l, self.xor_(), line=t.line)
+        return l
+
+    def xor_(self):
+        l = self.and_()
+        while self.is_("KW", "xor"):
+            t = self.next()
+            l = Binary("xor", l, self.and_(), line=t.line)
         return l
 
     def and_(self):
@@ -499,16 +534,45 @@ class Parser:
         return self.cmp()
 
     def cmp(self):
-        l = self.add()
+        l = self.bitor()
         while True:
             if self.is_("OP") and self.tok.val in ("==", "!=", "<", "<=", ">", ">="):
                 t = self.next()
-                l = Binary(t.val, l, self.add(), line=t.line)
+                l = Binary(t.val, l, self.bitor(), line=t.line)
             elif self.is_("KW", "instanceof"):
                 t = self.next()
                 l = InstanceOf(l, self.dotted_name(), line=t.line)
             else:
                 return l
+
+    # bitwise operators bind tighter than comparisons, as in Python
+    def bitor(self):
+        l = self.bitxor()
+        while self.is_("OP", "|"):
+            t = self.next()
+            l = Binary("|", l, self.bitxor(), line=t.line)
+        return l
+
+    def bitxor(self):
+        l = self.bitand()
+        while self.is_("OP", "^"):
+            t = self.next()
+            l = Binary("^", l, self.bitand(), line=t.line)
+        return l
+
+    def bitand(self):
+        l = self.shift()
+        while self.is_("OP", "&"):
+            t = self.next()
+            l = Binary("&", l, self.shift(), line=t.line)
+        return l
+
+    def shift(self):
+        l = self.add()
+        while self.is_("OP") and self.tok.val in ("<<", ">>", ">>>"):
+            t = self.next()
+            l = Binary(t.val, l, self.add(), line=t.line)
+        return l
 
     def add(self):
         l = self.mul()
@@ -525,9 +589,9 @@ class Parser:
         return l
 
     def unary(self):
-        if self.is_("OP", "-"):
+        if self.is_("OP", "-") or self.is_("OP", "~"):
             t = self.next()
-            return Unary("-", self.unary(), line=t.line)
+            return Unary(t.val, self.unary(), line=t.line)
         e = self.postfix()
         while self.is_("KW", "as"):
             t = self.next()
@@ -643,6 +707,16 @@ INTRINSICS = {
     "__sleep_ms": (["int"], "void", "quill_sleep_ms"),
     "__panic": (["str"], "void", "quill_panic"),
     "__exc_msg": ([], "str", "quill_exc_msg"),
+    "__str_alloc": (["int"], "str", "quill_str_alloc"),
+    "__str_set": (["str", "int", "int"], "void", "quill_str_set"),
+    "__str_byte": (["str", "int"], "int", "quill_str_byte"),
+    "__entropy": ([], "int", "quill_entropy"),
+    "__native_alloc": (["int"], "int", "quill_native_alloc"),
+    "__native_free": (["int"], "void", "quill_native_free"),
+    "__native_peek": (["int", "int"], "int", "quill_native_peek"),
+    "__native_poke": (["int", "int", "int"], "void", "quill_native_poke"),
+    "__native_cstr": (["int"], "str", "quill_native_cstr"),
+    "__native_take": (["int"], "str", "quill_native_take"),
     "__sqrt": (["float"], "float", "sqrt"),
     "__sin": (["float"], "float", "sin"),
     "__cos": (["float"], "float", "cos"),
@@ -1107,6 +1181,8 @@ declare i32 @snprintf(ptr, i64, ptr, ...)
 declare ptr @calloc(i64, i64)
 declare void @free(ptr)
 declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
+declare i32 @getentropy(ptr, i64)
 declare i32 @pthread_create(ptr, ptr, ptr, ptr)
 declare i32 @pthread_join(ptr, ptr)
 declare i32 @pthread_mutex_init(ptr, ptr)
@@ -1368,6 +1444,104 @@ define ptr @quill_concat(ptr %a, ptr %b) {
   ret ptr %m
 }
 
+; ---- raw string bytes, used by std.text and std.crypto ----
+; a new owned string of n bytes (filled with 'x'); callers overwrite it with quill_str_set
+define ptr @quill_str_alloc(i64 %n) {
+  %t = add i64 %n, 1
+  %m = call ptr @quill_alloc(i64 %t)
+  call void @llvm.memset.p0.i64(ptr %m, i8 120, i64 %n, i1 false)
+  %e = getelementptr i8, ptr %m, i64 %n
+  store i8 0, ptr %e
+  ret ptr %m
+}
+
+define void @quill_str_set(ptr %s, i64 %i, i64 %b) {
+  %p = getelementptr i8, ptr %s, i64 %i
+  %v = trunc i64 %b to i8
+  store i8 %v, ptr %p
+  ret void
+}
+
+define i64 @quill_str_byte(ptr %s, i64 %i) {
+  %p = getelementptr i8, ptr %s, i64 %i
+  %v = load i8, ptr %p
+  %z = zext i8 %v to i64
+  ret i64 %z
+}
+
+; ---- native code support (see docs/native.md) ----
+; copy a C string into a new Quill string (NULL stays null)
+define ptr @quill_str_from_c(ptr %c) {
+  %isnull = icmp eq ptr %c, null
+  br i1 %isnull, label %none, label %copy
+none:
+  ret ptr null
+copy:
+  %n = call i64 @strlen(ptr %c)
+  %t = add i64 %n, 1
+  %m = call ptr @quill_alloc(i64 %t)
+  call void @llvm.memcpy.p0.p0.i64(ptr %m, ptr %c, i64 %t, i1 false)
+  ret ptr %m
+}
+
+define ptr @quill_native_cstr(i64 %p) {
+  %c = inttoptr i64 %p to ptr
+  %s = call ptr @quill_str_from_c(ptr %c)
+  ret ptr %s
+}
+
+; copy a malloc'd C string and free the original
+define ptr @quill_native_take(i64 %p) {
+  %c = inttoptr i64 %p to ptr
+  %s = call ptr @quill_str_from_c(ptr %c)
+  call void @free(ptr %c)
+  ret ptr %s
+}
+
+; zeroed native memory, one byte longer than asked so it is always NUL terminated
+define i64 @quill_native_alloc(i64 %n) {
+  %t = add i64 %n, 1
+  %m = call ptr @calloc(i64 %t, i64 1)
+  %a = ptrtoint ptr %m to i64
+  ret i64 %a
+}
+
+define void @quill_native_free(i64 %p) {
+  %c = inttoptr i64 %p to ptr
+  call void @free(ptr %c)
+  ret void
+}
+
+define i64 @quill_native_peek(i64 %p, i64 %i) {
+  %a = add i64 %p, %i
+  %c = inttoptr i64 %a to ptr
+  %v = load i8, ptr %c
+  %z = zext i8 %v to i64
+  ret i64 %z
+}
+
+define void @quill_native_poke(i64 %p, i64 %i, i64 %b) {
+  %a = add i64 %p, %i
+  %c = inttoptr i64 %a to ptr
+  %v = trunc i64 %b to i8
+  store i8 %v, ptr %c
+  ret void
+}
+
+; 64 bits from the operating system's secure random source
+define i64 @quill_entropy() {
+  %buf = alloca i64
+  %r = call i32 @getentropy(ptr %buf, i64 8)
+  %bad = icmp ne i32 %r, 0
+  br i1 %bad, label %fail, label %ok
+fail:
+  call void @exit(i32 2)
+  unreachable
+ok:
+  %v = load i64, ptr %buf
+  ret i64 %v
+}
+
 ; ---- threads and mutexes (handles are pthread values stored as int) ----
 define i64 @quill_thread_start(ptr %obj) {
   %tid = alloca ptr
@@ -1498,6 +1672,105 @@ def iter_types(node):
         yield from iter_types(getattr(node, f.name))
 
 
+# ---- native (C) methods ----
+# A native method is bound with a C signature written in a small vocabulary:
+#   native static def crc(n: int, s: str) -> int = "crc32(ulong, cstr) -> ulong"
+# `cstr` is a C string (a str on the Quill side), `ptr` any other pointer (an int, an
+# address kept out of sight by the wrapper classes). Sizes follow the target platform.
+
+def _ctypes():
+    long_bits = 32 if sys.platform == "win32" else 64
+    t = {"char": ("int", 8, True), "schar": ("int", 8, True), "uchar": ("int", 8, False),
+         "short": ("int", 16, True), "ushort": ("int", 16, False),
+         "int": ("int", 32, True), "uint": ("int", 32, False),
+         "long": ("int", long_bits, True), "ulong": ("int", long_bits, False),
+         "llong": ("int", 64, True), "ullong": ("int", 64, False),
+         "size_t": ("int", 64, False), "ssize_t": ("int", 64, True),
+         "float": ("float", 32, True), "double": ("float", 64, True),
+         "bool": ("bool", 1, False), "cstr": ("cstr", 64, False), "ptr": ("ptr", 64, False),
+         "void": ("void", 0, False)}
+    for bits in (8, 16, 32, 64):
+        t[f"i{bits}"] = ("int", bits, True)
+        t[f"u{bits}"] = ("int", bits, False)
+    return t
+
+
+CTYPES = _ctypes()
+NATIVE_SIG = re.compile(r"^\s*([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(?:->\s*([A-Za-z_]\w*))?\s*$")
+QUILL_FOR = {"int": ("int", "ptr"), "float": ("float",), "bool": ("bool",), "cstr": ("str",), "ptr": ("int",)}
+
+
+def parse_native(sig, params, ret, line, file):
+    """'sym(ctype, ...) -> ctype' checked against the Quill signature; returns
+    (symbol, [ctype], ctype) with each ctype as (kind, bits, signed, name)."""
+    m = NATIVE_SIG.match(sig)
+    if not m:
+        raise CompileError(f'bad native signature "{sig}" (expected "symbol(ctype, ...) -> ctype")', line, file)
+    sym = m.group(1)
+    names = [a.strip() for a in m.group(2).split(",") if a.strip()]
+    rname = m.group(3) or "void"
+    def lookup(n):
+        if n not in CTYPES:
+            raise CompileError(f"unknown C type {n} in native signature (known: {', '.join(sorted(CTYPES))})", line, file)
+        return CTYPES[n] + (n,)
+    cargs = [lookup(n) for n in names]
+    cret = lookup(rname)
+    if len(cargs) != len(params):
+        raise CompileError(f"native signature has {len(cargs)} parameter(s) but the method declares {len(params)}", line, file)
+    for (pn, pt), c in zip(params, cargs):
+        if c[0] == "void" or pt not in QUILL_FOR[c[0]]:
+            raise CompileError(f"native parameter {pn} is {pt} in Quill but {c[3]} in the C signature", line, file)
+    if cret[0] == "void":
+        if ret != "void":
+            raise CompileError(f"native method returns {ret} in Quill but void in the C signature", line, file)
+    elif ret not in QUILL_FOR[cret[0]]:
+        raise CompileError(f"native method returns {ret} in Quill but {cret[3]} in the C signature", line, file)
+    return sym, cargs, cret
+
+
+def describe_in(name, qtype, c):
+    kind, bits, signed, cname = c
+    if kind == "int" and bits < 64:
+        how = f"cut down to {bits} bits ({'signed' if signed else 'unsigned'})"
+    elif kind == "int":
+        how = "passed as a 64-bit integer"
+    elif kind == "ptr":
+        how = "turned into an address (it came from a wrapper object, never typed by hand)"
+    elif kind == "cstr":
+        how = "passed as a C string, borrowed for the call: C must not keep it"
+    elif kind == "float" and bits == 32:
+        how = "narrowed to a 32-bit float"
+    elif kind == "bool":
+        how = "passed as a one-bit boolean"
+    else:
+        how = "passed unchanged"
+    return f"{name}: {qtype} -> {cname}, {how}"
+
+
+def describe_out(qret, cret):
+    kind, bits, signed, cname = cret
+    if kind == "void":
+        return "nothing returned"
+    how = {"int": f"widened to a 64-bit int ({'sign' if signed else 'zero'} extended)" if bits < 64 else "a 64-bit int",
+           "ptr": "the address is kept as an int; Quill never dereferences it",
+           "cstr": "copied into a new Quill string; C keeps ownership of its original",
+           "float": "widened to a double" if bits == 32 else "a double",
+           "bool": "a Quill bool"}[kind]
+    return f"{cname} -> {qret}, {how}"
+
+
+def c_llvm(c, ret=False):
+    """(llvm type, attribute) of a C type for declarations and calls."""
+    kind, bits, signed, _ = c
+    if kind == "int":
+        return f"i{bits}", ("signext" if signed else "zeroext") if bits < 32 else ""
+    if kind == "bool":
+        return "i1", "zeroext"
+    if kind == "float":
+        return ("float" if bits == 32 else "double"), ""
+    return "ptr", ""
+
+
 @dataclass
 class MethodInfo:
     name: str
@@ -1550,6 +1823,8 @@ class Module:
         self.templates = {}    # generic class name -> ClassDecl
         self.iface_ids = {}    # interface method name -> dispatch id
         self.iface_sigs = {}
+        self.native_decls = {}     # C symbol -> its LLVM `declare` line
+        self.native_bindings = []  # for `quill hood`: (method, C signature, steps, result)
         self.collect(decls)
 
     # ---- class table ----
@@ -1896,6 +2171,7 @@ done:
             for name in ci.vtable:
                 slots.append(f"ptr {self.find_class_method(ci, name).symbol}")
             out.append(f'@"vtable.{ci.name}" = constant [{len(slots)} x ptr] [{", ".join(slots)}]')
+        out.extend(self.native_decls.values())
         out.extend(funcs)
         out.append(self.uncaught_fn(concrete))
         for ci in concrete:
@@ -2138,8 +2414,62 @@ class FuncGen:
         return "null" if frm == "null" else val
 
     # ---- function ----
+    def generate_native(self):
+        """A method bound to a C function: convert the arguments, call, convert the result."""
+        mi, d = self.mi, self.mi.decl
+        file = getattr(self.ci.decl, "file", None)
+        sym, cargs, cret = parse_native(d.native, mi.params, mi.ret, d.line, file)
+        args, dparams = [], []
+        for (pn, pt), c in zip(mi.params, cargs):
+            v = f"%p.{pn}"
+            kind, bits, signed, _ = c
+            if kind == "int" and bits < 64:
+                v = self.op(f"trunc i64 {v} to i{bits}")
+            elif kind == "ptr":
+                v = self.op(f"inttoptr i64 {v} to ptr")
+            elif kind == "float" and bits == 32:
+                v = self.op(f"fptrunc double {v} to float")
+            ty, attr = c_llvm(c)
+            args.append(f"{ty} {attr} {v}".replace("  ", " "))
+            dparams.append(f"{ty} {attr}".strip())
+        rty, rattr = c_llvm(cret) if cret[0] != "void" else ("void", "")
+        decl = f"declare {rattr} {rty} @{sym}({', '.join(dparams)})".replace("  ", " ")
+        have = self.mod.native_decls.get(sym)
+        if have is not None and have != decl:
+            self.err(f"native function {sym} is declared with two different signatures", d)
+        for line in RUNTIME.split("\n"):
+            if line.startswith("declare ") and re.search(rf"@{re.escape(sym)}\(", line):
+                if line.replace(" ", "") != decl.replace(" ", ""):
+                    self.err(f"native function {sym} clashes with a runtime function of the same name", d)
+                decl = None
+        if decl and have is None:
+            self.mod.native_decls[sym] = decl
+        call = f"call {rattr} {rty} @{sym}({', '.join(args)})".replace("  ", " ")
+        steps = [describe_in(pn, pt, c) for (pn, pt), c in zip(mi.params, cargs)]
+        lret = self.mod.llty(mi.ret)
+        if cret[0] == "void":
+            self.emit(call)
+            self.emit("ret void")
+        else:
+            r = self.op(call)
+            kind, bits, signed, _ = cret
+            if kind == "int" and bits < 64:
+                r = self.op(f"{'sext' if signed else 'zext'} i{bits} {r} to i64")
+            elif kind == "ptr":
+                r = self.op(f"ptrtoint ptr {r} to i64")
+            elif kind == "float" and bits == 32:
+                r = self.op(f"fpext float {r} to double")
+            elif kind == "cstr":
+                r = self.op(f"call ptr @quill_str_from_c(ptr {r})")
+            self.emit(f"ret {lret} {r}")
+        self.mod.native_bindings.append((f"{mi.owner}.{mi.name}", d.native, steps, describe_out(mi.ret, cret)))
+        sig = ", ".join(f"{self.mod.llty(t)} %p.{n}" for n, t in mi.params)
+        return f'define {lret} {mi.symbol}({sig}) {{\nentry:\n' + "\n".join(self.lines) + "\n}"
+
     def generate(self):
         mi, ci = self.mi, self.ci
+        if mi.decl.native:
+            return self.generate_native()
         params = [] if mi.static else [("self", ci.name)]
         params += mi.params
         sig = ", ".join(f"{self.mod.llty(t)} %p.{n}" for n, t in params)
@@ -2571,6 +2901,9 @@ class FuncGen:
         if e.op == "not":
             if t != "bool": self.err("'not' needs a bool", e)
             return self.op(f"xor i1 {v}, true"), "bool"
+        if e.op == "~":
+            if t != "int": self.err(f"'~' needs an int, not {t}", e)
+            return self.op(f"xor i64 {v}, -1"), "int"
         if t == "int": return self.op(f"sub i64 0, {v}"), "int"
         if t == "float": return self.op(f"fneg double {v}"), "float"
         self.err(f"cannot negate {t}", e)
@@ -2589,6 +2922,8 @@ class FuncGen:
             self.release_fresh(lv, lt); self.release_fresh(rv, rt)
             self.fresh[r] = "str"
             return r, "str"
+        if e.op in ("&", "|", "^", "xor", "<<", ">>", ">>>"):
+            return self.bitwise(e, lv, lt, rv, rt)
         if lt not in NUM or rt not in NUM:
             self.err(f"operator {e.op} not supported for {lt} and {rt}", e)
         if "float" in (lt, rt):
@@ -2597,6 +2932,29 @@ class FuncGen:
             return self.op(f"{ins} double {lv}, {rv}"), "float"
         ins = {"+": "add", "-": "sub", "*": "mul", "/": "sdiv", "%": "srem"}[e.op]
         return self.op(f"{ins} i64 {lv}, {rv}"), "int"
+
+    def bitwise(self, e, lv, lt, rv, rt):
+        op = e.op
+        if lt == rt == "bool" and op in ("&", "|", "^", "xor"):
+            ins = {"&": "and", "|": "or", "^": "xor", "xor": "xor"}[op]   # both sides are evaluated
+            return self.op(f"{ins} i1 {lv}, {rv}"), "bool"
+        if op == "xor" and lt == rt == "int":
+            self.err("'xor' is the logical operator for bools; use ^ on ints", e)
+        if lt != "int" or rt != "int":
+            self.err(f"operator {op} needs two ints (or two bools), not {lt} and {rt}", e)
+        if op in ("&", "|", "^"):
+            ins = {"&": "and", "|": "or", "^": "xor"}[op]
+            return self.op(f"{ins} i64 {lv}, {rv}"), "int"
+        # a shift count outside 0..63 is undefined in LLVM; make it well defined:
+        # shifting everything out gives 0 (or the sign for >>)
+        inrange = self.op(f"icmp ult i64 {rv}, 64")
+        if op == ">>":
+            cnt = self.op(f"select i1 {inrange}, i64 {rv}, i64 63")
+            return self.op(f"ashr i64 {lv}, {cnt}"), "int"
+        cnt = self.op(f"select i1 {inrange}, i64 {rv}, i64 0")
+        ins = "shl" if op == "<<" else "lshr"
+        r = self.op(f"{ins} i64 {lv}, {cnt}")
+        return self.op(f"select i1 {inrange}, i64 {r}, i64 0"), "int"
 
     def compare(self, e, lv, lt, rv, rt):
         op = e.op
@@ -2963,7 +3321,7 @@ class FuncGen:
             kinds, ret, fn = INTRINSICS[name]
             if len(e.args) != len(kinds):
                 self.err(f"{name} takes {len(kinds)} argument(s)", e)
-            vals = []
+            vals, borrowed = [], []
             for a, k in zip(e.args, kinds):
                 v, t = self.expr(a)
                 if k == "int" and t == "int":
@@ -2972,20 +3330,27 @@ class FuncGen:
                     vals.append(f"double {self.coerce(v, t, 'float', a)}")
                 elif k == "str" and t == "str":
                     vals.append(f"ptr {v}")
+                    if fn != "quill_panic":
+                        borrowed.append(v)
                 elif k == "obj" and self.mod.is_class(t):
                     vals.append(f"ptr {self.consume(v, t)}")   # ownership moves to the callee
                 else:
                     self.err(f"bad argument to {name}: {t}", a)
             call = f"call {'i64' if ret == 'int' else 'ptr' if ret == 'str' else 'double' if ret == 'float' else 'void'} @{fn}({', '.join(vals)})"
             if ret == "float":
-                return self.op(call), "float"
-            if ret == "str":
+                r = self.op(call)
+            elif ret == "str":
                 r = self.op(call)
                 self.fresh[r] = "str"       # the runtime hands over an owned string
-                return r, "str"
-            if ret == "int":
-                return self.op(call), "int"
-            self.emit(call)
+            elif ret == "int":
+                r = self.op(call)
+            else:
+                r = None
+                self.emit(call)
+            for b in borrowed:              # a temporary string argument is ours to release
+                self.release_fresh(b, "str")
+            if ret != "void":
+                return r, ret
             if fn == "quill_panic":
                 self.raise_pending()
             return None, "void"
@@ -3144,11 +3509,53 @@ def qualify(decls, ns, names):
     walk(decls)
 
 
-def load_program(entry):
+@dataclass
+class NativeSpec:
+    """What a program needs from C/C++: filled from `native ...` directives in the
+    modules it brings, resolved relative to the module that declares them."""
+    libs: list = field(default_factory=list)       # -l flags (or raw link arguments)
+    libdirs: list = field(default_factory=list)
+    includes: list = field(default_factory=list)
+    sources: list = field(default_factory=list)
+    flags: list = field(default_factory=list)
+    modules: list = field(default_factory=list)    # the module files that use native code
+
+    @property
+    def active(self):
+        return bool(self.modules)
+
+    @property
+    def cpp(self):
+        return any(s.lower().endswith((".cpp", ".cc", ".cxx", ".c++")) for s in self.sources)
+
+    def add(self, kind, value, base, path, line):
+        resolve = lambda v: os.path.normpath(os.path.join(base, os.path.expanduser(v)))
+        if kind == "link":
+            self.libs.extend(shlex.split(value) if value.startswith("-") else ["-l" + value])
+        elif kind == "libdir":
+            self.libdirs.append("-L" + resolve(value))
+        elif kind == "include":
+            self.includes.append("-I" + resolve(value))
+        elif kind == "source":
+            self.sources.append(resolve(value))
+        elif kind == "flag":
+            self.flags.extend(shlex.split(value))
+        else:
+            raise CompileError(f"unknown native directive {kind}", line, path)
+
+    def compile_args(self):
+        return [*self.includes, *self.flags]
+
+    def link_args(self):
+        return [*self.libdirs, *self.libs]
+
+
+def load_program(entry, natives=None, trace=None):
     """Parse `entry` and every module it brings in; returns all class declarations.
     Modules brought with `as NAME` (and the other modules of the same package they
     bring) have their classes renamed NAME.Class."""
     ctx = quillpkg.context_for(entry)
+    root_pkg = ctx.package_of(entry)
     files, seen = [], {}                      # files: [(path, decls, namespace)]
 
     def visit(path, pkg, ns, at=(None, 0)):
@@ -3164,13 +3571,27 @@ def load_program(entry):
         with open(path, encoding="utf-8") as f:
             src = f.read()
         try:
-            parser = Parser(lex(src))
+            toks = lex(src)
+            parser = Parser(toks)
             found = parser.program()
         except CompileError as e:
             e.file = e.file or path
             raise
         for d in found:
             d.file = path
+        if parser.natives or any(m.native for d in found for m in d.methods):
+            if pkg is not root_pkg and pkg.name != "std":
+                raise CompileError(
+                    f"this module of package {pkg.name} contains native (C/C++) code. `needs` cannot fetch "
+                    "native libraries; wrap the library yourself with `quill wrap` and keep the wrapper in "
+                    "your own project (see docs/native.md)", 1, path)
+            if natives is not None:
+                natives.modules.append(path)
+                for kind, value, line in parser.natives:
+                    natives.add(kind, value, os.path.dirname(os.path.abspath(path)), path, line)
+        if trace is not None:
+            trace.append(dict(path=path, package=pkg.name, alias=ns, classes=[d.name for d in found],
+                              lines=len(src.splitlines()), tokens=len(toks), native=bool(parser.natives)))
         files.append((path, found, ns))
         for name, line, alias in parser.imports:
             try:
@@ -3182,7 +3603,7 @@ def load_program(entry):
             inherit = ns if tpkg is pkg and pkg.name != "std" else ""
             visit(target, tpkg, alias or inherit, (path, line))
 
-    visit(entry, ctx.package_of(entry), "")
+    visit(entry, root_pkg, "")
     spaces = {}
     for _, found, ns in files:
         if ns:
@@ -3200,16 +3621,22 @@ def load_program(entry):
     return decls, origin
 
 
-def compile_file(path):
+def compile_file(path, natives=None, hood=None):
+    """Compile a program to LLVM IR text. `natives` (a NativeSpec) collects what the
+    program needs from C; `hood` (a dict) collects internals for `quill hood`."""
     prelude = Parser(lex(PRELUDE)).program()
     for d in prelude:
         d.file = "<built-in>"
-    decls, _ = load_program(path)
+    decls, origin = load_program(path, natives, hood.setdefault("modules", []) if hood is not None else None)
     seen = {d.name for d in prelude}
     for d in decls:
         if d.name in seen:
             raise CompileError(f"class {d.name} clashes with a built-in class", d.line, d.file)
-    return Module(prelude + decls).generate()
+    mod = Module(prelude + decls)
+    ir = mod.generate()
+    if hood is not None:
+        hood.update(module=mod, origin=origin, user=[d.name for d in decls], builtin=[d.name for d in prelude])
+    return ir
 
 
 def mark_sanitize(ir, kind):
@@ -3219,9 +3646,125 @@ def mark_sanitize(ir, kind):
     return re.sub(r"^(define [^\n]*) \{$", r"\1 " + attr + " {", ir, flags=re.M)
 
 
+def signed64(x):
+    return x - (1 << 64) if x >= 1 << 63 else x
+
+
+CHECK_ALIVE = signed64(0x51554C4C414C4956)
+CHECK_FREED = signed64(0x51554C4C46524545)
+CHECK_CANARY = signed64(0x51554C4C43414E52)
+CHECK_DEAD = signed64(0xDDDDDDDDDDDDDDDD)
+
+
+def add_checks(ir):
+    """The built-in memory checker (`--check`, and what `--sanitize address` means on Windows,
+    where the real AddressSanitizer is not available). It swaps the runtime's allocator for one
+    that keeps a canary after every block, remembers freed blocks (poisoned, never reused) and
+    reports a double free, a use after free, an overflow, or any object still alive at exit."""
+    alloc = f'''define ptr @quill_alloc(i64 %size) {{
+  %t = add i64 %size, 16
+  %n = add i64 %t, 32
+  %r = call ptr @calloc(i64 1, i64 %n)
+  store i64 %t, ptr %r
+  %mp = getelementptr i8, ptr %r, i64 8
+  store i64 {CHECK_ALIVE}, ptr %mp
+  %m = getelementptr i8, ptr %r, i64 16
+  %cp = getelementptr i8, ptr %m, i64 %t
+  store i64 {CHECK_CANARY}, ptr %cp
+  store i64 1, ptr %m
+  %w = getelementptr i8, ptr %m, i64 8
+  store i64 1, ptr %w
+  %o = atomicrmw add ptr @quill_live, i64 1 monotonic, align 8
+  %p = getelementptr i8, ptr %m, i64 16
+  ret ptr %p
+}}
+
+define void @quill_check_fail(ptr %msg) {{
+  %u = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.chk.fmt, ptr %msg)
+  call void @exit(i32 70)
+  unreachable
+}}
+
+define void @quill_probe(ptr %h) {{
+  %v = load i64, ptr %h
+  %dead = icmp eq i64 %v, {CHECK_DEAD}
+  br i1 %dead, label %bad, label %ok
+bad:
+  call void @quill_check_fail(ptr @.chk.uaf)
+  unreachable
+ok:
+  ret void
+}}
+
+define void @quill_free(ptr %hdr) {{
+  %mp = getelementptr i8, ptr %hdr, i64 -8
+  %magic = load i64, ptr %mp
+  %alive = icmp eq i64 %magic, {CHECK_ALIVE}
+  br i1 %alive, label %scan, label %notalive
+notalive:
+  %was = icmp eq i64 %magic, {CHECK_FREED}
+  br i1 %was, label %dbl, label %corrupt
+dbl:
+  call void @quill_check_fail(ptr @.chk.dbl)
+  unreachable
+corrupt:
+  call void @quill_check_fail(ptr @.chk.bad)
+  unreachable
+scan:
+  %sp = getelementptr i8, ptr %hdr, i64 -16
+  %size = load i64, ptr %sp
+  %cp = getelementptr i8, ptr %hdr, i64 %size
+  %c = load i64, ptr %cp
+  %fine = icmp eq i64 %c, {CHECK_CANARY}
+  br i1 %fine, label %kill, label %over
+over:
+  call void @quill_check_fail(ptr @.chk.over)
+  unreachable
+kill:
+  store i64 {CHECK_FREED}, ptr %mp
+  call void @llvm.memset.p0.i64(ptr %hdr, i8 221, i64 %size, i1 false)
+  %o = atomicrmw sub ptr @quill_live, i64 1 monotonic, align 8
+  ret void
+}}
+
+define void @quill_check_exit() {{
+  %live = load i64, ptr @quill_live
+  %any = icmp ne i64 %live, 0
+  br i1 %any, label %leak, label %done
+leak:
+  %u = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.chk.leak, i64 %live)
+  br label %done
+done:
+  ret void
+}}
+
+@llvm.global_dtors = appending global [1 x {{ i32, ptr, ptr }}] [{{ i32, ptr, ptr }} {{ i32 65535, ptr @quill_check_exit, ptr null }}]
+'''
+    alloc += "\n".join([
+        cstr("@.chk.fmt", "quill check: %s\n"),
+        cstr("@.chk.leak", "quill check: %lld heap object(s) still alive at exit\n"),
+        cstr("@.chk.uaf", "use of freed memory (use after free, or a value released twice)"),
+        cstr("@.chk.dbl", "double free"),
+        cstr("@.chk.bad", "invalid free: the heap block header is corrupted"),
+        cstr("@.chk.over", "heap buffer overflow: something wrote past the end of an object or string"),
+    ]) + "\n"
+    ir, n = re.subn(r"define ptr @quill_alloc\(i64 %size\) \{.*?\n\}\n\ndefine void @quill_free\(ptr %hdr\) \{.*?\n\}\n",
+                    lambda m: alloc, ir, count=1, flags=re.S)
+    assert n == 1, "runtime layout changed; update add_checks"
+    probed = "  %h = getelementptr i8, ptr %p, i64 -16\n"
+    return ir.replace(probed, probed + "  call void @quill_probe(ptr %h)\n")
+
+
 WIN_SHIM = """#include <stdarg.h>
 #include <stdio.h>
 #include <io.h>
+#include <stddef.h>
+#include <windows.h>
+int getentropy(void *buf, size_t n) {
+    typedef BOOLEAN (WINAPI *rtl_gen_random)(PVOID, ULONG);
+    rtl_gen_random fn = (rtl_gen_random)GetProcAddress(LoadLibraryA("advapi32.dll"), "SystemFunction036");
+    return fn && fn(buf, (ULONG)n) ? 0 : -1;
+}
 int dprintf(int fd, const char *fmt, ...) {
     char buf[1024];
     va_list ap; va_start(ap, fmt);
@@ -3242,7 +3785,17 @@ def find_tool(name):
     return fallback if os.path.exists(fallback) else name
 
 
-def build_windows(ll, out, opt):
+COMMAND_LOG = []        # every external tool the build ran: (command, exit code, seconds)
+
+
+def run_tool(cmd):
+    t0 = time.time()
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    COMMAND_LOG.append((cmd, r.returncode, time.time() - t0))
+    return r
+
+
+def build_windows(ll, out, opt, natives):
     """The runtime uses POSIX calls (pthreads, dprintf), so on Windows compile with
     clang for the mingw target and link with gcc plus a dprintf shim."""
     with tempfile.TemporaryDirectory() as d:
@@ -3250,24 +3803,52 @@ def build_windows(ll, out, opt):
         with open(shim, "w") as f:
             f.write(WIN_SHIM)
         obj = os.path.join(d, "prog.o")
-        r = subprocess.run([find_tool("clang"), opt, "-c", "--target=x86_64-w64-mingw32",
-                            "-Wno-override-module", ll, "-o", obj],
-                           capture_output=True, text=True)
+        r = run_tool([find_tool("clang"), opt, "-c", "--target=x86_64-w64-mingw32",
+                      "-Wno-override-module", ll, "-o", obj])
         if r.returncode:
             return r
+        shim_obj = os.path.join(d, "shim.o")
+        r = run_tool(["gcc", "-c", shim, "-o", shim_obj])
+        if r.returncode:
+            return r
+        objs = [shim_obj]
+        for i, src in enumerate(natives.sources):
+            cxx = src.lower().endswith((".cpp", ".cc", ".cxx", ".c++"))
+            o = os.path.join(d, f"native{i}.o")
+            r = run_tool(["g++" if cxx else "gcc", opt, "-c", src, "-o", o, *natives.compile_args()])
+            if r.returncode:
+                return r
+            objs.append(o)
         exe = out if out.endswith(".exe") else out + ".exe"
-        r = subprocess.run(["gcc", obj, shim, "-o", exe, "-lpthread"],
-                           capture_output=True, text=True)
+        r = run_tool(["g++" if natives.cpp else "gcc", obj, *objs, "-o", exe, "-lpthread",
+                      *natives.link_args()])
         r.exe = exe
         return r
 
 
-def build(path, out, opt="-O1", keep_ll=False, sanitize=None):
+def build(path, out, opt="-O1", keep_ll=False, sanitize=None, natives=None, hood=None, check=False):
+    natives = natives if natives is not None else NativeSpec()
     try:
-        ir = compile_file(path)
+        ir = compile_file(path, natives, hood)
     except CompileError as e:
         print(f"{e.file or path}:{e.line}: error: {e.msg}", file=sys.stderr)
         sys.exit(1)
+    if natives.active and not os.environ.get("QUILL_QUIET_NATIVE"):
+        names = ", ".join(os.path.basename(m) for m in natives.modules)
+        print(f"note: native (C/C++) code is linked in via {names}. The compiler cannot check it; "
+              "a wrong declaration can crash. See docs/native.md (silence with QUILL_QUIET_NATIVE=1).",
+              file=sys.stderr)
+    if sanitize == "thread" and sys.platform == "win32":
+        print("error: ThreadSanitizer is not available on Windows (no thread checker exists for the "
+              "MinGW toolchain); guard shared state with a Mutex, or run the tests on Linux or macOS",
+              file=sys.stderr)
+        sys.exit(2)
+    if sanitize == "address" and sys.platform == "win32":
+        print("note: AddressSanitizer needs the MSVC toolchain, so on Windows --sanitize address uses "
+              "Quill's built-in memory checker instead (see docs/check.md)", file=sys.stderr)
+        sanitize, check = None, True
+    if check:
+        ir = add_checks(ir)
     if sanitize:
         ir = mark_sanitize(ir, sanitize)
     ll = out + ".ll" if keep_ll else tempfile.mktemp(suffix=".ll")
@@ -3275,17 +3856,14 @@ def build(path, out, opt="-O1", keep_ll=False, sanitize=None):
         f.write(ir)
     flags = [f"-fsanitize={sanitize}", "-g"] if sanitize else []
     if sys.platform == "win32":
-        if sanitize:
-            print("error: --sanitize is not supported on Windows", file=sys.stderr)
-            sys.exit(2)
-        r = build_windows(ll, out, opt)
+        r = build_windows(ll, out, opt, natives)
     else:
-        r = subprocess.run(["clang", opt, *flags, "-Wno-override-module", ll, "-o", out, "-lm"],
-                           capture_output=True, text=True)
+        r = run_tool(["clang++" if natives.cpp else "clang", opt, *flags, "-Wno-override-module", ll,
+                      *natives.sources, *natives.compile_args(), "-o", out, "-lm", *natives.link_args()])
     if not keep_ll:
         os.unlink(ll)
     if r.returncode:
-        print("internal error: clang rejected generated IR\n" + r.stderr, file=sys.stderr)
+        print("internal error: the C/C++ toolchain failed\n" + r.stderr, file=sys.stderr)
         sys.exit(2)
     return r.exe if hasattr(r, "exe") else out
 
@@ -3301,14 +3879,20 @@ def main():
         return sp
 
     san = dict(choices=["address", "thread"], help="build with AddressSanitizer or ThreadSanitizer")
+    chk = dict(action="store_true", help="build with Quill's built-in memory checker (works everywhere, including Windows)")
     sp = compiler_cmd("run", "compile and run a program")
     sp.add_argument("--sanitize", **san)
+    sp.add_argument("--check", **chk)
     sp = compiler_cmd("build", "compile to a native executable")
     sp.add_argument("-o", "--out")
     sp.add_argument("--keep-ll", action="store_true")
     sp.add_argument("--sanitize", **san)
+    sp.add_argument("--check", **chk)
     compiler_cmd("emit", "print the LLVM IR")
 
+    import quillwrap, quillhood
+    quillwrap.add_parser(sub)
+    quillhood.add_parser(sub)
     sp = sub.add_parser("new", help="create a project in a new folder")
     sp.add_argument("name")
     sp.add_argument("--lib", action="store_true", help="a library: no start module")
@@ -3334,6 +3918,10 @@ def main():
     sub.add_parser("tree", help="show the dependency tree")
     a = ap.parse_args()
 
+    if a.cmd == "wrap":
+        sys.exit(quillwrap.run(a))
+    if a.cmd == "hood":
+        sys.exit(quillhood.run(a))
     if a.cmd in ("new", "init", "install", "update", "add", "drop", "tree"):
         sys.exit(quillpkg.cli(a.cmd, a))
 
@@ -3352,11 +3940,11 @@ def main():
         elif a.cmd == "build":
             out = a.out or out_default or os.path.splitext(path)[0]
             os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-            exe = build(path, out, f"-O{a.O}", a.keep_ll, a.sanitize)
+            exe = build(path, out, f"-O{a.O}", a.keep_ll, a.sanitize, check=a.check)
             print(f"built {os.path.relpath(exe)}")
         else:
             with tempfile.TemporaryDirectory() as d:
-                exe = build(path, os.path.join(d, "prog"), f"-O{a.O}", sanitize=a.sanitize)
+                exe = build(path, os.path.join(d, "prog"), f"-O{a.O}", sanitize=a.sanitize, check=a.check)
                 sys.exit(subprocess.run([exe]).returncode)
     except quillpkg.PackageError as e:
         print(f"quill: {e}", file=sys.stderr)
