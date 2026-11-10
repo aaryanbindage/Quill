@@ -26,14 +26,14 @@
 - **Primitives are not objects.** `int`, `str` and the others have no methods.
 - **Collections are basic.** `List` and `Map` have no literals (`[1, 2]`), sorting, slicing or `Set`. `Map` iteration order is unspecified, objects used as keys compare by identity, and you cannot loop over a `Map` directly.
 - **Generics are template-style.** Every method of an instantiated generic is compiled for that type, there are no constraints on type parameters, no generic methods on ordinary classes, and no static calls on generic classes. Code size grows with the number of instantiations.
-- **Errors are not catchable.** Index and missing-key errors stop the program with exit status 1.
+- **Exceptions leak what they unwind.** They use `setjmp`/`longjmp`, so locals and parameters owned by the frames an exception skips are never released: objects reachable only from them (for example a `List` whose method panicked) stay allocated. A `Mutex` locked in a skipped frame stays locked. Objects thrown and caught are freed normally. There is no `finally`.
 
 ## Planned, in priority order
 
 1. `protected`, and default methods in interfaces.
 2. Primitives as objects with methods (`"hi".upper()`, `x.toString()`).
 3. List and map literals, `Set[T]`, sorting, direct `Map` iteration, and generic methods.
-4. Exceptions (`try`/`catch`/`throw`).
+4. `finally`, and cleanup of unwound frames (so exceptions stop leaking).
 5. An explicit-stack drop to avoid deep recursion, and weak parameters and
    returns.
 6. Concurrency primitives: condition variables, atomic integers, channels,

@@ -32,6 +32,7 @@ KEYWORDS = {
     "while", "for", "in", "new", "self", "true", "false", "null", "and",
     "or", "not", "break", "continue", "pass", "weak",
     "public", "private", "abstract", "interface", "super", "instanceof", "as",
+    "try", "catch", "throw",
 }
 
 TOKEN_RE = re.compile(r'''
@@ -182,6 +183,10 @@ class ForRange(N): var: str; start: N; end: N; body: list
 class Return(N): value: N
 @dataclass
 class ExprStmt(N): e: N
+@dataclass
+class Throw(N): value: N
+@dataclass
+class Try(N): body: list; catches: list   # catches: [(class or None, var or None, body, line)]
 @dataclass
 class Break(N): pass
 @dataclass
@@ -351,6 +356,26 @@ class Parser:
                 v = None if self.is_("NEWLINE") else self.expr()
                 self.expect("NEWLINE")
                 return [Return(v, line=t.line)]
+            if kw == "throw":
+                self.next()
+                v = self.expr()
+                self.expect("NEWLINE")
+                return [Throw(v, line=t.line)]
+            if kw == "try":
+                self.next()
+                body = self.block()
+                catches = []
+                while self.is_("KW", "catch"):
+                    c = self.next()
+                    cls = var = None
+                    if self.is_("NAME"):
+                        cls = self.next().val
+                        if self.accept("KW", "as"):
+                            var = self.expect("NAME").val
+                    catches.append((cls, var, self.block(), c.line))
+                if not catches:
+                    raise CompileError("try needs at least one catch", t.line)
+                return [Try(body, catches, line=t.line)]
             if kw in ("break", "continue"):
                 self.next(); self.expect("NEWLINE")
                 return [(Break if kw == "break" else Continue)(line=t.line)]
@@ -558,6 +583,7 @@ INTRINSICS = {
     "__mutex_free": (["int"], "void", "quill_mutex_free"),
     "__sleep_ms": (["int"], "void", "quill_sleep_ms"),
     "__panic": (["str"], "void", "quill_panic"),
+    "__exc_msg": ([], "str", "quill_exc_msg"),
 }
 
 # Built-in classes, written in Quill and compiled with every program.
@@ -591,6 +617,20 @@ class Mutex:
 
     def deinit(self):
         __mutex_free(self.handle)
+
+# Base class for exceptions. Runtime errors (bad index, null dereference, ...)
+# are thrown as plain Errors carrying the panic message.
+class Error:
+    message: str
+
+    def init(self, message: str):
+        self.message = message
+
+    def toString(self) -> str:
+        return "Error: " + self.message
+
+    static def fromPanic() -> Error:
+        return new Error(__exc_msg())
 
 # A growable array. Written as a template: List[int], List[str], List[Node]...
 class List[T]:
@@ -972,15 +1012,46 @@ missing:
   ret ptr null
 }
 
-define void @quill_panic(ptr %msg) {
-  %r = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.fmt.panic, ptr %msg)
+; ---- exceptions: a per-thread stack of setjmp frames ----
+; frame = { prev frame, (padding), jmp_buf at +16 }; @quill_exc holds the thrown
+; object (null for a runtime panic, whose message is in @quill_exc_text)
+@quill_top = thread_local global ptr null
+@quill_exc = thread_local global ptr null
+@quill_exc_text = thread_local global ptr null
+
+define void @quill_throw() {
+  %f = load ptr, ptr @quill_top
+  %none = icmp eq ptr %f, null
+  br i1 %none, label %fatal, label %jump
+fatal:
+  call void @quill_uncaught()
   call void @exit(i32 1)
+  unreachable
+jump:
+  %prev = load ptr, ptr %f
+  store ptr %prev, ptr @quill_top
+  %jb = getelementptr i8, ptr %f, i64 16
+  call void @longjmp(ptr %jb, i32 1)
+  unreachable
+}
+
+define ptr @quill_exc_msg() {
+  %m = load ptr, ptr @quill_exc_text
+  store ptr null, ptr @quill_exc_text
+  ret ptr %m
+}
+
+define void @quill_panic(ptr %msg) {
+  store ptr null, ptr @quill_exc
+  store ptr %msg, ptr @quill_exc_text
+  call void @quill_throw()
   unreachable
 }
 
 define void @quill_panic_index(i64 %i, i64 %n) {
-  %r = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.fmt.index, i64 %i, i64 %n)
-  call void @exit(i32 1)
+  %buf = call ptr @quill_alloc(i64 96)
+  %r = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 96, ptr @.fmt.index, i64 %i, i64 %n)
+  call void @quill_panic(ptr %buf)
   unreachable
 }
 
@@ -1068,7 +1139,14 @@ define void @quill_sleep_ms(i64 %ms) {
 '''
 
 RUNTIME += "\n" + cstr("@.fmt.panic", "error: %s\n") + "\n" + \
-    cstr("@.fmt.index", "error: index %ld out of range (length %ld)\n") + "\n"
+    cstr("@.fmt.index", "index %ld out of range (length %ld)") + "\n" + \
+    cstr("@.fmt.uncaught", "error: uncaught exception: %s\n") + "\n" + \
+    cstr("@.fmt.uncaught0", "error: uncaught exception\n") + "\n"
+
+# setjmp/longjmp: the mingw runtime wants the frame address as a second argument
+# of _setjmp, and passing null skips its SEH unwinding, which generated code lacks
+RUNTIME += ("declare i32 @_setjmp(ptr, ptr) returns_twice\n" if sys.platform == "win32"
+            else "declare i32 @_setjmp(ptr) returns_twice\n") + "declare void @longjmp(ptr, i32) noreturn\n"
 
 
 def split_top(s):
@@ -1394,6 +1472,39 @@ class Module:
     def is_ref(self, t):
         return t == "str" or t in self.classes
 
+    def uncaught_fn(self, concrete):
+        """Reports an exception nobody caught: a panic message, an Error's message,
+        or just the fact that something was thrown."""
+        errs = [ci for ci in concrete if ci.elem is None and self.is_subclass(ci.name, "Error")]
+        L = ["define void @quill_uncaught() {",
+             "  %e = load ptr, ptr @quill_exc",
+             "  %isn = icmp eq ptr %e, null",
+             "  br i1 %isn, label %panic, label %obj",
+             "panic:",
+             "  %pm = load ptr, ptr @quill_exc_text",
+             "  %r0 = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.fmt.panic, ptr %pm)",
+             "  ret void",
+             "obj:",
+             "  %vt = load ptr, ptr %e"]
+        acc = "false"
+        for i, ci in enumerate(errs):
+            L.append(f'  %h{i} = icmp eq ptr %vt, @"vtable.{ci.name}"')
+            L.append(f"  %a{i} = or i1 {acc}, %h{i}")
+            acc = f"%a{i}"
+        L += [f"  br i1 {acc}, label %err, label %other",
+              "err:",
+              '  %mp = getelementptr %"Error", ptr %e, i32 0, i32 1',
+              "  %m = load ptr, ptr %mp",
+              "  %mn = icmp eq ptr %m, null",
+              f"  %ms = select i1 %mn, ptr {self.string('(no message)')}, ptr %m",
+              "  %r1 = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.fmt.uncaught, ptr %ms)",
+              "  ret void",
+              "other:",
+              "  %r2 = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.fmt.uncaught0)",
+              "  ret void",
+              "}"]
+        return "\n".join(L)
+
     def drop_fn(self, ci):
         if ci.elem is not None:
             return self.array_drop_fn(ci)
@@ -1476,6 +1587,7 @@ done:
                 slots.append(f"ptr {self.find_class_method(ci, name).symbol}")
             out.append(f'@"vtable.{ci.name}" = constant [{len(slots)} x ptr] [{", ".join(slots)}]')
         out.extend(funcs)
+        out.append(self.uncaught_fn(concrete))
         for ci in concrete:
             out.append(self.drop_fn(ci))
         slot = self.classes["Thread"].vtable.index("run") + 2   # slots 0, 1 = drop, itable
@@ -1508,6 +1620,8 @@ class FuncGen:
         self.scopes = [{}]
         self.terminated = False
         self.loops = []
+        self.tries = []          # frames of the try blocks being compiled, innermost last
+        self.uses_try = False
         self.fresh = set()   # temps that hold an owned (+1) reference
 
     # ---- low-level helpers ----
@@ -1641,7 +1755,8 @@ class FuncGen:
         if not self.terminated:
             zero = {"void": None, "i64": "0", "double": "0.0", "i1": "false", "ptr": "null"}[ret]
             self.emit("ret void" if ret == "void" else f"ret {ret} {zero}")
-        return (f'define {ret} {mi.symbol}({sig}) {{\nentry:\n'
+        attrs = " optnone noinline" if self.uses_try else ""    # keep locals in memory across longjmp
+        return (f'define {ret} {mi.symbol}({sig}){attrs} {{\nentry:\n'
                 + "\n".join(self.allocas + self.lines) + "\n}")
 
     # ---- statements ----
@@ -1728,6 +1843,7 @@ class FuncGen:
             if want != "void":
                 self.err(f"must return a {want}", s)
             self.release_from(0)
+            self.pop_handlers(0)
             self.emit("ret void")
         else:
             if want == "void":
@@ -1735,6 +1851,7 @@ class FuncGen:
             v, t = self.expr(s.value)
             v = self.coerce(self.consume(v, t), t, want, s, "return value")
             self.release_from(0)
+            self.pop_handlers(0)
             self.emit(f"ret {self.mod.llty(want)} {v}")
         self.terminated = True
 
@@ -1753,7 +1870,7 @@ class FuncGen:
         self.br(c_l); self.place(c_l)
         self.condbr(self.cond(s.cond), b_l, e_l)
         self.place(b_l)
-        self.loops.append((c_l, e_l, len(self.scopes))); self.block(s.body); self.loops.pop()
+        self.loops.append((c_l, e_l, len(self.scopes), len(self.tries))); self.block(s.body); self.loops.pop()
         self.br(c_l); self.place(e_l)
 
     def s_ForRange(self, s):
@@ -1769,7 +1886,7 @@ class FuncGen:
         cur = self.op(f"load i64, ptr {ptr}")
         self.condbr(self.op(f"icmp slt i64 {cur}, {ev}"), b_l, e_l)
         self.place(b_l)
-        self.loops.append((i_l, e_l, len(self.scopes))); self.block(s.body); self.loops.pop()
+        self.loops.append((i_l, e_l, len(self.scopes), len(self.tries))); self.block(s.body); self.loops.pop()
         self.br(i_l); self.place(i_l)
         cur = self.op(f"load i64, ptr {ptr}")
         nxt = self.op(f"add i64 {cur}, 1")
@@ -1777,14 +1894,93 @@ class FuncGen:
         self.br(c_l); self.place(e_l)
         self.scopes.pop()
 
+    def pop_handlers(self, depth):
+        """Unlink the try frames above `depth` when control leaves them early."""
+        if len(self.tries) > depth:
+            prev = self.op(f"load ptr, ptr {self.tries[depth]}")
+            self.emit(f"store ptr {prev}, ptr @quill_top")
+
+    def s_Throw(self, s):
+        v, t = self.expr(s.value)
+        if not self.mod.is_class(t):
+            self.err(f"can only throw objects, got {t}", s)
+        self.null_check(v, "cannot throw null")
+        self.consume(v, t)                       # the exception slot owns the reference
+        self.emit(f"store ptr {v}, ptr @quill_exc")
+        self.emit("call void @quill_throw()")
+        self.emit("unreachable")
+        self.terminated = True
+
+    def s_Try(self, s):
+        self.uses_try = True
+        frame = self.alloca("[66 x i64], align 16", "exc.frame")
+        prev = self.op("load ptr, ptr @quill_top")
+        self.emit(f"store ptr {prev}, ptr {frame}")
+        self.emit(f"store ptr {frame}, ptr @quill_top")
+        jb = self.op(f"getelementptr i8, ptr {frame}, i64 16")
+        call = f"call i32 @_setjmp(ptr {jb}, ptr null)" if sys.platform == "win32" else f"call i32 @_setjmp(ptr {jb})"
+        r = self.op(call + " returns_twice")
+        body, handler, end = self.label("try.body"), self.label("try.catch"), self.label("try.end")
+        self.condbr(self.op(f"icmp eq i32 {r}, 0"), body, handler)
+
+        self.place(body)
+        self.tries.append(frame)
+        self.block(s.body)
+        self.tries.pop()
+        if not self.terminated:
+            back = self.op(f"load ptr, ptr {frame}")
+            self.emit(f"store ptr {back}, ptr @quill_top")      # leaving normally: unlink
+        self.br(end)
+
+        # a throw already unlinked the frame; pick up the exception
+        self.place(handler)
+        slot = self.alloca("ptr", "exc")
+        self.emit(f"store ptr {self.op('load ptr, ptr @quill_exc')}, ptr {slot}")
+        self.emit("store ptr null, ptr @quill_exc")
+        panic, have = self.label("exc.panic"), self.label("exc.have")
+        self.condbr(self.op(f"icmp eq ptr {self.op(f'load ptr, ptr {slot}')}, null"), panic, have)
+        self.place(panic)                        # a runtime panic: wrap its message in an Error
+        pv, pt = self.expr(Call(FieldAccess(Name("Error", line=s.line), "fromPanic", line=s.line), [], line=s.line))
+        self.consume(pv, pt)
+        self.emit(f"store ptr {pv}, ptr {slot}")
+        self.br(have)
+        self.place(have)
+        for cls, var, cbody, cline in s.catches:
+            nxt, hit = self.label("catch.next"), self.label("catch.hit")
+            exc = self.op(f"load ptr, ptr {slot}")
+            if cls is not None:
+                self.condbr(self.type_test(exc, cls, Name(cls, line=cline)), hit, nxt)
+            else:
+                self.br(hit)
+            self.place(hit)
+            self.scopes.append({})
+            if var is not None:
+                ptr = self.declare(var, cls, Name(var, line=cline))
+                self.emit(f"store ptr {exc}, ptr {ptr}")        # the variable now owns it
+            else:
+                self.release(exc, "obj")
+            self.block(cbody)
+            self.release_from(len(self.scopes) - 1)
+            self.scopes.pop()
+            self.br(end)
+            self.place(nxt)
+        # nothing matched: throw it again to the enclosing handler
+        self.emit(f"store ptr {self.op(f'load ptr, ptr {slot}')}, ptr @quill_exc")
+        self.emit("call void @quill_throw()")
+        self.emit("unreachable")
+        self.terminated = True
+        self.place(end)
+
     def s_Break(self, s):
         if not self.loops: self.err("break outside loop", s)
         self.release_from(self.loops[-1][2])
+        self.pop_handlers(self.loops[-1][3])
         self.br(self.loops[-1][1])
 
     def s_Continue(self, s):
         if not self.loops: self.err("continue outside loop", s)
         self.release_from(self.loops[-1][2])
+        self.pop_handlers(self.loops[-1][3])
         self.br(self.loops[-1][0])
 
     # ---- expressions: each returns (llvm operand, quill type) ----
@@ -2201,7 +2397,11 @@ class FuncGen:
                     vals.append(f"ptr {self.consume(v, t)}")   # ownership moves to the callee
                 else:
                     self.err(f"bad argument to {name}: {t}", a)
-            call = f"call {'i64' if ret == 'int' else 'void'} @{fn}({', '.join(vals)})"
+            call = f"call {'i64' if ret == 'int' else 'ptr' if ret == 'str' else 'void'} @{fn}({', '.join(vals)})"
+            if ret == "str":
+                r = self.op(call)
+                self.fresh.add(r)           # the runtime hands over an owned string
+                return r, "str"
             if ret == "int":
                 return self.op(call), "int"
             self.emit(call)

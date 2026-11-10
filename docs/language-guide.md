@@ -21,7 +21,7 @@ class Main:
 - Strings use double quotes with escapes `\n \t \r \0 \\ \"`.
 - Keywords: `class def static return if elif else while for in new self true
   false null and or not break continue pass weak
-  public private abstract interface super instanceof as`.
+  public private abstract interface super instanceof as try catch throw`.
 
 ## Types
 
@@ -479,6 +479,45 @@ A class that defines `def toString(self) -> str` is printed through it by
 Reading or writing a field, calling a method, indexing, or taking `len` of a
 `null` value stops the program with `error: null pointer dereference` and exit
 status 1 instead of crashing. Concatenating a `null` string is checked the same way.
+
+## Exceptions
+
+`throw` raises any object. `try` runs a block, and the first `catch` clause
+whose class matches the thrown object (the class itself, a subclass, or an
+implementer of an interface) handles it. A bare `catch:` takes anything.
+
+```python
+class NotFound < Error:
+    def init(self, what: str):
+        super.init(what + " not found")
+
+class Main:
+    static def find(i: int) -> int:
+        if i < 0:
+            throw new NotFound("item")
+        return i
+
+    static def main():
+        try:
+            print(Main.find(-1))
+        catch NotFound as e:
+            print("caught:", e.message)
+        catch Error as e:        # also receives runtime errors, see below
+            print("other:", e.message)
+```
+
+- `Error` is a built-in class with a `message: str` field. Subclass it for your
+  own exceptions; any other class can be thrown too.
+- Runtime errors (list or array index out of range, missing map key, `null`
+  dereference, bad cast, ...) are thrown as an `Error` whose message is the
+  panic text, so `catch Error as e` handles them.
+- A clause with no match passes the exception on to the enclosing `try`; a
+  `throw` inside a `catch` block does the same. An exception nobody catches
+  prints `error: uncaught exception: <message>` and exits with status 1 (runtime
+  errors print `error: <message>` as before).
+- `return`, `break` and `continue` may leave a `try` block.
+- There is no `finally`. Locals owned by the frames an exception unwinds are
+  not released (see the roadmap).
 
 ## Errors
 
