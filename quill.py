@@ -32,7 +32,7 @@ KEYWORDS = {
     "while", "for", "in", "new", "self", "true", "false", "null", "and",
     "or", "not", "break", "continue", "pass", "weak",
     "public", "private", "abstract", "interface", "super", "instanceof", "as",
-    "try", "catch", "throw",
+    "try", "catch", "finally", "throw",
 }
 
 TOKEN_RE = re.compile(r'''
@@ -186,7 +186,7 @@ class ExprStmt(N): e: N
 @dataclass
 class Throw(N): value: N
 @dataclass
-class Try(N): body: list; catches: list   # catches: [(class or None, var or None, body, line)]
+class Try(N): body: list; catches: list; final: list = None   # catches: [(class or None, var or None, body, line)]
 @dataclass
 class Break(N): pass
 @dataclass
@@ -373,9 +373,12 @@ class Parser:
                         if self.accept("KW", "as"):
                             var = self.expect("NAME").val
                     catches.append((cls, var, self.block(), c.line))
-                if not catches:
-                    raise CompileError("try needs at least one catch", t.line)
-                return [Try(body, catches, line=t.line)]
+                final = None
+                if self.accept("KW", "finally"):
+                    final = self.block()
+                if not catches and final is None:
+                    raise CompileError("try needs at least one catch or a finally", t.line)
+                return [Try(body, catches, final, line=t.line)]
             if kw in ("break", "continue"):
                 self.next(); self.expect("NEWLINE")
                 return [(Break if kw == "break" else Continue)(line=t.line)]
@@ -1842,17 +1845,17 @@ class FuncGen:
         if s.value is None:
             if want != "void":
                 self.err(f"must return a {want}", s)
-            self.release_from(0)
-            self.pop_handlers(0)
-            self.emit("ret void")
+            self.leave(0, 0)
+            if not self.terminated:
+                self.emit("ret void")
         else:
             if want == "void":
                 self.err("void method cannot return a value", s)
             v, t = self.expr(s.value)
             v = self.coerce(self.consume(v, t), t, want, s, "return value")
-            self.release_from(0)
-            self.pop_handlers(0)
-            self.emit(f"ret {self.mod.llty(want)} {v}")
+            self.leave(0, 0)
+            if not self.terminated:
+                self.emit(f"ret {self.mod.llty(want)} {v}")
         self.terminated = True
 
     def s_If(self, s):
@@ -1894,11 +1897,31 @@ class FuncGen:
         self.br(c_l); self.place(e_l)
         self.scopes.pop()
 
-    def pop_handlers(self, depth):
-        """Unlink the try frames above `depth` when control leaves them early."""
-        if len(self.tries) > depth:
-            prev = self.op(f"load ptr, ptr {self.tries[depth]}")
+    def release_range(self, lo, hi, scopes):
+        for sc in reversed(scopes[lo:hi]):
+            self.release_scope(sc)
+
+    def leave(self, try_depth, scope_depth):
+        """Control leaves early (return, break, continue): release the scopes it
+        skips, unlink the try frames above `try_depth` and run their finally blocks,
+        innermost first. A finally block may itself end the flow (return, throw)."""
+        if self.terminated:
+            return
+        scopes, tries = self.scopes, self.tries
+        hi = len(scopes)
+        for k in range(len(tries) - 1, try_depth - 1, -1):
+            frame, final, sd = tries[k]
+            self.release_range(sd, hi, scopes)
+            hi = sd
+            prev = self.op(f"load ptr, ptr {frame}")
             self.emit(f"store ptr {prev}, ptr @quill_top")
+            if final is not None:
+                self.scopes, self.tries = scopes[:sd], tries[:k]
+                self.block(final)
+                self.scopes, self.tries = scopes, tries
+                if self.terminated:
+                    return
+        self.release_range(scope_depth, hi, scopes)
 
     def s_Throw(self, s):
         v, t = self.expr(s.value)
@@ -1911,7 +1934,8 @@ class FuncGen:
         self.emit("unreachable")
         self.terminated = True
 
-    def s_Try(self, s):
+    def push_frame(self):
+        """Link a new exception frame and run setjmp; returns (frame, i1 'first time')."""
         self.uses_try = True
         frame = self.alloca("[66 x i64], align 16", "exc.frame")
         prev = self.op("load ptr, ptr @quill_top")
@@ -1920,12 +1944,51 @@ class FuncGen:
         jb = self.op(f"getelementptr i8, ptr {frame}, i64 16")
         call = f"call i32 @_setjmp(ptr {jb}, ptr null)" if sys.platform == "win32" else f"call i32 @_setjmp(ptr {jb})"
         r = self.op(call + " returns_twice")
+        return frame, self.op(f"icmp eq i32 {r}, 0")
+
+    def s_Try(self, s):
+        if s.final is None:
+            return self.try_catch(s.body, s.catches, s)
+        # try/finally: an outer frame catches whatever escapes, runs the finally
+        # block, then throws it again; normal exits and return/break/continue run
+        # the same block inline (see leave)
+        frame, first = self.push_frame()
+        body, handler, end = self.label("fin.body"), self.label("fin.catch"), self.label("fin.end")
+        self.condbr(first, body, handler)
+        self.place(body)
+        self.tries.append((frame, s.final, len(self.scopes)))
+        if s.catches:
+            self.try_catch(s.body, s.catches, s)
+        else:
+            self.block(s.body)
+        self.tries.pop()
+        if not self.terminated:
+            back = self.op(f"load ptr, ptr {frame}")
+            self.emit(f"store ptr {back}, ptr @quill_top")
+            self.block(s.final)
+        self.br(end)
+        self.place(handler)
+        # keep the in-flight exception (object or panic text) safe across the finally block
+        exc, txt = self.alloca("ptr", "fin.exc"), self.alloca("ptr", "fin.txt")
+        self.emit(f"store ptr {self.op('load ptr, ptr @quill_exc')}, ptr {exc}")
+        self.emit(f"store ptr {self.op('load ptr, ptr @quill_exc_text')}, ptr {txt}")
+        self.block(s.final)
+        if not self.terminated:
+            self.emit(f"store ptr {self.op(f'load ptr, ptr {exc}')}, ptr @quill_exc")
+            self.emit(f"store ptr {self.op(f'load ptr, ptr {txt}')}, ptr @quill_exc_text")
+            self.emit("call void @quill_throw()")
+            self.emit("unreachable")
+            self.terminated = True
+        self.place(end)
+
+    def try_catch(self, body_stmts, catches, s):
+        frame, first = self.push_frame()
         body, handler, end = self.label("try.body"), self.label("try.catch"), self.label("try.end")
-        self.condbr(self.op(f"icmp eq i32 {r}, 0"), body, handler)
+        self.condbr(first, body, handler)
 
         self.place(body)
-        self.tries.append(frame)
-        self.block(s.body)
+        self.tries.append((frame, None, len(self.scopes)))
+        self.block(body_stmts)
         self.tries.pop()
         if not self.terminated:
             back = self.op(f"load ptr, ptr {frame}")
@@ -1945,7 +2008,7 @@ class FuncGen:
         self.emit(f"store ptr {pv}, ptr {slot}")
         self.br(have)
         self.place(have)
-        for cls, var, cbody, cline in s.catches:
+        for cls, var, cbody, cline in catches:
             nxt, hit = self.label("catch.next"), self.label("catch.hit")
             exc = self.op(f"load ptr, ptr {slot}")
             if cls is not None:
@@ -1973,14 +2036,12 @@ class FuncGen:
 
     def s_Break(self, s):
         if not self.loops: self.err("break outside loop", s)
-        self.release_from(self.loops[-1][2])
-        self.pop_handlers(self.loops[-1][3])
+        self.leave(self.loops[-1][3], self.loops[-1][2])
         self.br(self.loops[-1][1])
 
     def s_Continue(self, s):
         if not self.loops: self.err("continue outside loop", s)
-        self.release_from(self.loops[-1][2])
-        self.pop_handlers(self.loops[-1][3])
+        self.leave(self.loops[-1][3], self.loops[-1][2])
         self.br(self.loops[-1][0])
 
     # ---- expressions: each returns (llvm operand, quill type) ----

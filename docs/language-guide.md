@@ -516,8 +516,27 @@ class Main:
   prints `error: uncaught exception: <message>` and exits with status 1 (runtime
   errors print `error: <message>` as before).
 - `return`, `break` and `continue` may leave a `try` block.
-- There is no `finally`. Locals owned by the frames an exception unwinds are
-  not released (see the roadmap).
+- Locals owned by the frames an exception unwinds are not released (see the
+  roadmap).
+
+### `finally`
+
+A `finally` block runs however the `try` ends: normal completion, after a
+`catch` clause, when an exception propagates (unmatched, or thrown from a
+`catch` block), and when `return`, `break` or `continue` leaves the block. A
+`try` needs at least one `catch` or a `finally`.
+
+```python
+f: File = new File("data.txt")
+try:
+    f.process()
+finally:
+    f.close()          # runs even if process() throws or returns
+```
+
+When several `try` blocks are left at once, their `finally` blocks run
+innermost first. A `return` or `throw` inside `finally` replaces whatever was
+in flight.
 
 ## Errors
 
