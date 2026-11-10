@@ -334,6 +334,27 @@ for name in ages.keys():
   over them is safe; the loop just won't see the changes.
 - You cannot loop over a `Map` directly; loop over `m.keys()` or `m.values()`.
 
+## List and map literals
+
+```python
+primes = [2, 3, 5, 7]                         # List[int]
+ratios: List[float] = [1, 2.5]                # ints widen to float
+pets: List[Animal] = [new Dog("Rex"), new Cat("Tom")]
+ages = {"ann" -> 31, "bo" -> 27}              # Map[str,int]
+index = {"evens" -> [2, 4], "odds" -> [1, 3]} # Map[str,List[int]]
+none: Map[str, int] = {}
+```
+
+A map entry is written `key -> value`; the arrow is the same one used for
+return types. Literals may span several lines and end with a trailing comma.
+
+The element type is taken from the declared type when there is one (variable,
+field assignment, parameter or return type), otherwise from the elements: all
+the same type, `int` mixed with `float` (giving `float`), or a type every other
+element can be assigned to. `null` elements are allowed for `str` and classes.
+An empty `[]` or `{}` needs a declared type. A literal builds a new `List` or
+`Map`, so a repeated map key keeps its last value.
+
 ## Indexing and `for` loops
 
 - `x[i]` on an `Array` reads an element. On any other class it calls

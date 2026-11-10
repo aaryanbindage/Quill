@@ -42,7 +42,7 @@ TOKEN_RE = re.compile(r'''
     (?P<INT>\d+) |
     (?P<STR>"(?:[^"\\\n]|\\.)*") |
     (?P<NAME>[A-Za-z_]\w*) |
-    (?P<OP>->|==|!=|<=|>=|\+=|-=|\*=|/=|%=|[-+*/%<>=(),.:\[\]])
+    (?P<OP>->|==|!=|<=|>=|\+=|-=|\*=|/=|%=|[-+*/%<>=(),.:{}\[\]])
 ''', re.X)
 
 ESCAPES = {"n": "\n", "t": "\t", "\\": "\\", '"': '"', "0": "\0", "r": "\r"}
@@ -110,15 +110,15 @@ def lex(src):
             elif kind == "NAME":
                 toks.append(Tok("KW" if text in KEYWORDS else "NAME", text, lineno))
             else:
-                if text == "(":
+                if text in "([{":
                     depth += 1
-                elif text == ")":
+                elif text in ")]}":
                     depth -= 1
                 toks.append(Tok("OP", text, lineno))
         if depth == 0:
             toks.append(Tok("NEWLINE", None, lineno))
     if depth != 0:
-        raise CompileError("unbalanced parentheses", len(src.split("\n")))
+        raise CompileError("unbalanced brackets", len(src.split("\n")))
     last = toks[-1].line if toks else 1
     while len(stack) > 1:
         stack.pop()
@@ -184,9 +184,15 @@ class Return(N): value: N
 @dataclass
 class ExprStmt(N): e: N
 @dataclass
+class ListLit(N): items: list
+@dataclass
+class MapLit(N): keys: list; vals: list
+@dataclass
+class Catch(N): cls: str; var: str; body: list
+@dataclass
 class Throw(N): value: N
 @dataclass
-class Try(N): body: list; catches: list; final: list = None   # catches: [(class or None, var or None, body, line)]
+class Try(N): body: list; catches: list; final: list = None   # catches: [Catch]
 @dataclass
 class Break(N): pass
 @dataclass
@@ -372,7 +378,7 @@ class Parser:
                         cls = self.next().val
                         if self.accept("KW", "as"):
                             var = self.expect("NAME").val
-                    catches.append((cls, var, self.block(), c.line))
+                    catches.append(Catch(cls, var, self.block(), line=c.line))
                 final = None
                 if self.accept("KW", "finally"):
                     final = self.block()
@@ -560,6 +566,24 @@ class Parser:
             e = self.expr()
             self.expect("OP", ")")
             return e
+        if t.kind == "OP" and t.val == "[":
+            items = []
+            while not self.is_("OP", "]"):
+                items.append(self.expr())
+                if not self.accept("OP", ","):
+                    break
+            self.expect("OP", "]")
+            return ListLit(items, line=t.line)
+        if t.kind == "OP" and t.val == "{":
+            keys, vals = [], []
+            while not self.is_("OP", "}"):
+                keys.append(self.expr())
+                self.expect("OP", "->")
+                vals.append(self.expr())
+                if not self.accept("OP", ","):
+                    break
+            self.expect("OP", "}")
+            return MapLit(keys, vals, line=t.line)
         raise CompileError(f"unexpected {t.val if t.val is not None else t.kind!r}", t.line)
 
 
@@ -1296,94 +1320,9 @@ class Module:
             d = work.pop()
             for t, line in iter_types(d):
                 self.ensure(t, line, work)
-        done = set()
-
-        def build(ci, stack=()):
-            if ci.name in done:
-                return
-            if ci.name in stack:
-                raise CompileError(f"cyclic inheritance involving {ci.name}", ci.decl.line)
-            d = ci.decl
-            sup = []
-            for n in d.supers:
-                if n not in self.classes:
-                    raise CompileError(f"unknown class or interface {n}", d.line)
-                sup.append(self.classes[n])
-                build(sup[-1], stack + (ci.name,))
-            parents = [c for c in sup if not c.is_interface]
-            ifaces = [c for c in sup if c.is_interface]
-            if d.interface and parents:
-                raise CompileError("an interface can only extend interfaces", d.line)
-            if len(parents) > 1:
-                raise CompileError(f"{ci.name} can extend only one class (the rest must be interfaces)", d.line)
-            ci.parent = parents[0] if parents else None
-            ci.interfaces = ifaces
-            ci.supers = {ci.name}.union(*[c.supers for c in sup]) if sup else {ci.name}
-            if ci.parent:
-                ci.fields = list(ci.parent.fields)
-                ci.field_info = dict(ci.parent.field_info)
-                ci.vtable = list(ci.parent.vtable)
-                ci.required = dict(ci.parent.required)
-            for i in ifaces:
-                for n, im in i.required.items():
-                    old = ci.required.get(n)
-                    if old and (old.params != im.params or old.ret != im.ret):
-                        raise CompileError(f"conflicting signatures for interface method {n}", d.line)
-                    ci.required[n] = im
-            if d.interface and d.fields:
-                raise CompileError("interfaces cannot have fields", d.line)
-            for f in d.fields:
-                self.check_type(f.type, f.line)
-                if any(f.name == n for n, _ in ci.fields):
-                    raise CompileError(f"duplicate field {f.name}", f.line)
-                ci.fields.append((f.name, f.type))
-                ci.field_info[f.name] = (ci.name, f.access)
-            for m in d.methods:
-                if m.name in ci.methods:
-                    raise CompileError(f"duplicate method {m.name}", m.line)
-                for _, t in m.params:
-                    self.check_type(t, m.line)
-                    if self.is_weak(t):
-                        raise CompileError("parameters cannot be weak", m.line)
-                self.check_type(m.ret, m.line)
-                if self.is_weak(m.ret):
-                    raise CompileError("return types cannot be weak", m.line)
-                if m.name == "deinit" and (m.static or m.params or m.ret != "void"):
-                    raise CompileError("deinit must be an instance method with no parameters and no result", m.line)
-                if m.abstract and not d.abstract and not d.interface:
-                    raise CompileError(f"abstract method {m.name} in non-abstract class {ci.name}", m.line)
-                if m.abstract and (m.static or m.access == "private"):
-                    raise CompileError("abstract methods cannot be static or private", m.line)
-                if d.interface and (m.name in ("init", "deinit") or m.access == "private"):
-                    raise CompileError("interfaces can only declare public instance methods", m.line)
-                mi = MethodInfo(m.name, ci.name, m.params, m.ret, m.static, m,
-                                m.access, m.abstract, d.interface)
-                ci.methods[m.name] = mi
-                if d.interface:
-                    old = self.iface_sigs.setdefault(m.name, (m.params, m.ret))
-                    if old != (m.params, m.ret):
-                        raise CompileError(f"interface method name {m.name} is declared with different signatures", m.line)
-                    self.iface_ids.setdefault(m.name, len(self.iface_ids))
-                    ci.required[m.name] = mi
-                    continue
-                if m.static or m.name in ("init", "deinit"):
-                    continue
-                prev = self.find_class_method(ci.parent, m.name) if ci.parent else None
-                if prev and prev.access == "private":
-                    prev = None            # private methods are not inherited or overridden
-                if m.access == "private":
-                    if prev:
-                        raise CompileError(f"{ci.name}.{m.name} cannot reduce the visibility of the method it overrides", m.line)
-                    continue               # private methods are non-virtual
-                if prev:
-                    if prev.static or prev.params != m.params or prev.ret != m.ret:
-                        raise CompileError(f"{ci.name}.{m.name} has a different signature than the method it overrides", m.line)
-                elif m.name not in ci.vtable:
-                    ci.vtable.append(m.name)
-            done.add(ci.name)
-
+        self.built = set()
         for ci in self.classes.values():
-            build(ci)
+            self.build_class(ci)
 
         # every concrete class must implement all abstract and interface methods
         for ci in self.classes.values():
@@ -1405,6 +1344,105 @@ class Module:
                     raise CompileError(f"{impl.owner}.{name} implements an interface method, so it cannot be private", impl.decl.line)
                 if impl.params != im.params or impl.ret != im.ret:
                     raise CompileError(f"{impl.owner}.{name} has a different signature than interface method {im.owner}.{name}", impl.decl.line)
+
+    def build_class(self, ci, stack=()):
+        if ci.name in self.built:
+            return
+        if ci.name in stack:
+            raise CompileError(f"cyclic inheritance involving {ci.name}", ci.decl.line)
+        d = ci.decl
+        sup = []
+        for n in d.supers:
+            if n not in self.classes:
+                raise CompileError(f"unknown class or interface {n}", d.line)
+            sup.append(self.classes[n])
+            self.build_class(sup[-1], stack + (ci.name,))
+        parents = [c for c in sup if not c.is_interface]
+        ifaces = [c for c in sup if c.is_interface]
+        if d.interface and parents:
+            raise CompileError("an interface can only extend interfaces", d.line)
+        if len(parents) > 1:
+            raise CompileError(f"{ci.name} can extend only one class (the rest must be interfaces)", d.line)
+        ci.parent = parents[0] if parents else None
+        ci.interfaces = ifaces
+        ci.supers = {ci.name}.union(*[c.supers for c in sup]) if sup else {ci.name}
+        if ci.parent:
+            ci.fields = list(ci.parent.fields)
+            ci.field_info = dict(ci.parent.field_info)
+            ci.vtable = list(ci.parent.vtable)
+            ci.required = dict(ci.parent.required)
+        for i in ifaces:
+            for n, im in i.required.items():
+                old = ci.required.get(n)
+                if old and (old.params != im.params or old.ret != im.ret):
+                    raise CompileError(f"conflicting signatures for interface method {n}", d.line)
+                ci.required[n] = im
+        if d.interface and d.fields:
+            raise CompileError("interfaces cannot have fields", d.line)
+        for f in d.fields:
+            self.check_type(f.type, f.line)
+            if any(f.name == n for n, _ in ci.fields):
+                raise CompileError(f"duplicate field {f.name}", f.line)
+            ci.fields.append((f.name, f.type))
+            ci.field_info[f.name] = (ci.name, f.access)
+        for m in d.methods:
+            if m.name in ci.methods:
+                raise CompileError(f"duplicate method {m.name}", m.line)
+            for _, t in m.params:
+                self.check_type(t, m.line)
+                if self.is_weak(t):
+                    raise CompileError("parameters cannot be weak", m.line)
+            self.check_type(m.ret, m.line)
+            if self.is_weak(m.ret):
+                raise CompileError("return types cannot be weak", m.line)
+            if m.name == "deinit" and (m.static or m.params or m.ret != "void"):
+                raise CompileError("deinit must be an instance method with no parameters and no result", m.line)
+            if m.abstract and not d.abstract and not d.interface:
+                raise CompileError(f"abstract method {m.name} in non-abstract class {ci.name}", m.line)
+            if m.abstract and (m.static or m.access == "private"):
+                raise CompileError("abstract methods cannot be static or private", m.line)
+            if d.interface and (m.name in ("init", "deinit") or m.access == "private"):
+                raise CompileError("interfaces can only declare public instance methods", m.line)
+            mi = MethodInfo(m.name, ci.name, m.params, m.ret, m.static, m,
+                            m.access, m.abstract, d.interface)
+            ci.methods[m.name] = mi
+            if d.interface:
+                old = self.iface_sigs.setdefault(m.name, (m.params, m.ret))
+                if old != (m.params, m.ret):
+                    raise CompileError(f"interface method name {m.name} is declared with different signatures", m.line)
+                self.iface_ids.setdefault(m.name, len(self.iface_ids))
+                ci.required[m.name] = mi
+                continue
+            if m.static or m.name in ("init", "deinit"):
+                continue
+            prev = self.find_class_method(ci.parent, m.name) if ci.parent else None
+            if prev and prev.access == "private":
+                prev = None            # private methods are not inherited or overridden
+            if m.access == "private":
+                if prev:
+                    raise CompileError(f"{ci.name}.{m.name} cannot reduce the visibility of the method it overrides", m.line)
+                continue               # private methods are non-virtual
+            if prev:
+                if prev.static or prev.params != m.params or prev.ret != m.ret:
+                    raise CompileError(f"{ci.name}.{m.name} has a different signature than the method it overrides", m.line)
+            elif m.name not in ci.vtable:
+                ci.vtable.append(m.name)
+        self.built.add(ci.name)
+
+    def instantiate(self, t, line):
+        """Create a generic instance such as List[int] while code is being generated
+        (literals only learn their element types then)."""
+        if t in self.classes:
+            return
+        before = set(self.classes)
+        work = []
+        self.ensure(t, line, work)
+        while work:
+            d = work.pop()
+            for tt, ln in iter_types(d):
+                self.ensure(tt, ln, work)
+        for name in [n for n in self.classes if n not in before]:
+            self.build_class(self.classes[name])
 
     def ensure(self, t, line, work):
         """Instantiate a generic type like List[int] (and its arguments) if needed."""
@@ -1568,10 +1606,16 @@ done:
             raise CompileError("Main.main must return void or int", mm.decl.line)
 
         funcs = []
-        for ci in self.classes.values():
-            for mi in ci.methods.values():
-                if not mi.abstract:
-                    funcs.append(FuncGen(self, ci, mi).generate())
+        seen = set()
+        while True:
+            todo = [ci for ci in list(self.classes.values()) if ci.name not in seen]
+            if not todo:
+                break
+            for ci in todo:
+                seen.add(ci.name)
+                for mi in ci.methods.values():
+                    if not mi.abstract:
+                        funcs.append(FuncGen(self, ci, mi).generate())
 
         out = [RUNTIME]
         objects = [ci for ci in self.classes.values() if not ci.is_interface]
@@ -1787,7 +1831,7 @@ class FuncGen:
             return
         val = None
         if s.init is not None:
-            v, t = self.expr(s.init)
+            v, t = self.expr_want(s.init, s.type)
             val = self.coerce(self.consume(v, t), t, s.type, s, "initializer")
         ptr = self.declare(s.name, s.type, s)
         lt = self.mod.llty(s.type)
@@ -1805,7 +1849,7 @@ class FuncGen:
             ptr = self.declare(s.target.id, t, s)
             self.emit(f"store {self.mod.llty(t)} {v}, ptr {ptr}")
             return
-        v, t = self.expr(s.value)               # value first, then the target
+        v, t = self.expr_want(s.value, self.peek_type(s.target))   # value first, then the target
         self.consume(v, t)
         ptr, ty, ov, ot = self.lvalue(s.target)
         if self.mod.is_weak(ty):
@@ -1851,7 +1895,7 @@ class FuncGen:
         else:
             if want == "void":
                 self.err("void method cannot return a value", s)
-            v, t = self.expr(s.value)
+            v, t = self.expr_want(s.value, want)
             v = self.coerce(self.consume(v, t), t, want, s, "return value")
             self.leave(0, 0)
             if not self.terminated:
@@ -2008,7 +2052,8 @@ class FuncGen:
         self.emit(f"store ptr {pv}, ptr {slot}")
         self.br(have)
         self.place(have)
-        for cls, var, cbody, cline in catches:
+        for cat in catches:
+            cls, var, cbody, cline = cat.cls, cat.var, cat.body, cat.line
             nxt, hit = self.label("catch.next"), self.label("catch.hit")
             exc = self.op(f"load ptr, ptr {slot}")
             if cls is not None:
@@ -2047,6 +2092,78 @@ class FuncGen:
     # ---- expressions: each returns (llvm operand, quill type) ----
     def expr(self, e):
         return getattr(self, "e_" + type(e).__name__)(e)
+
+    def expr_want(self, e, want):
+        """Evaluate e; a list or map literal takes its element types from `want`."""
+        if want is not None and isinstance(e, (ListLit, MapLit)):
+            return getattr(self, "e_" + type(e).__name__)(e, want)
+        return self.expr(e)
+
+    def peek_type(self, target):
+        """The declared type of an assignment target, when it is cheap to know."""
+        if isinstance(target, Name):
+            var = self.lookup(target.id)
+            return var[1] if var else None
+        if isinstance(target, FieldAccess) and isinstance(target.obj, SelfExpr):
+            return dict(self.ci.fields).get(target.name)
+        return None
+
+    def common_type(self, types, node, what):
+        ts = [t for t in types if t != "null"]
+        if not ts:
+            return None
+        if any(t == "void" for t in ts):
+            self.err(f"a {what} cannot hold a void value", node)
+        if all(t == ts[0] for t in ts):
+            return ts[0]
+        if all(t in NUM for t in ts):
+            return "float"
+        for cand in ts:
+            if all(self.assignable(t, cand) for t in ts):
+                return cand
+        self.err(f"the {what}'s elements have no common type; declare the type you want", node)
+
+    def e_ListLit(self, e, want=None):
+        et = None
+        if want and parse_type(want)[0] == "List":
+            et = parse_type(want)[1][0]
+        vals = [self.expr_want(x, et) for x in e.items]
+        if et is None:
+            et = self.common_type([t for _, t in vals], e, "list")
+            if et is None:
+                self.err("cannot tell what this list holds; declare the variable's type", e)
+        name = f"List[{et}]"
+        self.mod.instantiate(name, e.line)
+        lst, _ = self.e_New(New(name, [], line=e.line))
+        add = self.mod.find_method(self.mod.classes[name], "add")
+        for (v, t), x in zip(vals, e.items):
+            cv = self.coerce(v, t, et, x, "list element")
+            self.emit(f"call void {add.symbol}(ptr {lst}, {self.mod.llty(et)} {cv})")
+            self.release_fresh(v, t)
+        return lst, name
+
+    def e_MapLit(self, e, want=None):
+        kt = vt = None
+        if want and parse_type(want)[0] == "Map":
+            kt, vt = parse_type(want)[1]
+        ks = [self.expr_want(x, kt) for x in e.keys]
+        vs = [self.expr_want(x, vt) for x in e.vals]
+        if kt is None:
+            kt = self.common_type([t for _, t in ks], e, "map")
+            vt = self.common_type([t for _, t in vs], e, "map")
+            if kt is None or vt is None:
+                self.err("cannot tell what this map holds; declare the variable's type", e)
+        name = f"Map[{kt},{vt}]"
+        self.mod.instantiate(name, e.line)
+        mp, _ = self.e_New(New(name, [], line=e.line))
+        put = self.mod.find_method(self.mod.classes[name], "put")
+        for (k, ktype), (v, vtype), kx, vx in zip(ks, vs, e.keys, e.vals):
+            ck = self.coerce(k, ktype, kt, kx, "map key")
+            cv = self.coerce(v, vtype, vt, vx, "map value")
+            self.emit(f"call void {put.symbol}(ptr {mp}, {self.mod.llty(kt)} {ck}, {self.mod.llty(vt)} {cv})")
+            self.release_fresh(k, ktype)
+            self.release_fresh(v, vtype)
+        return mp, name
 
     def cond(self, e):
         v, t = self.expr(e)
@@ -2256,7 +2373,7 @@ class FuncGen:
         vals = [] if self_val is None else [f"ptr {self_val}"]
         temps = []
         for a, (pn, pt) in zip(args, mi.params):
-            v, t = self.expr(a)
+            v, t = self.expr_want(a, pt)
             vals.append(f"{self.mod.llty(pt)} {self.coerce(v, t, pt, a, 'argument ' + pn)}")
             temps.append((v, pt))
         rt = self.mod.llty(mi.ret)

@@ -24,7 +24,7 @@
 - **Only `public` and `private`.** There is no `protected`, and no package or module level.
 - **Interface calls scan a table.** Dispatch through an interface is a linear search per call.
 - **Primitives are not objects.** `int`, `str` and the others have no methods.
-- **Collections are basic.** `List` and `Map` have no literals (`[1, 2]`), sorting, slicing or `Set`. `Map` iteration order is unspecified, objects used as keys compare by identity, and you cannot loop over a `Map` directly.
+- **Collections are basic.** `List` and `Map` have no sorting, slicing or `Set` (they do have literals). `Map` iteration order is unspecified, objects used as keys compare by identity, and you cannot loop over a `Map` directly.
 - **Generics are template-style.** Every method of an instantiated generic is compiled for that type, there are no constraints on type parameters, no generic methods on ordinary classes, and no static calls on generic classes. Code size grows with the number of instantiations.
 - **Exceptions leak what they unwind.** They use `setjmp`/`longjmp`, so locals and parameters owned by the frames an exception skips are never released: objects reachable only from them (for example a `List` whose method panicked) stay allocated. A `Mutex` locked in a skipped frame stays locked. Objects thrown and caught are freed normally.
 
@@ -32,7 +32,7 @@
 
 1. `protected`, and default methods in interfaces.
 2. Primitives as objects with methods (`"hi".upper()`, `x.toString()`).
-3. List and map literals, `Set[T]`, sorting, direct `Map` iteration, and generic methods.
+3. `Set[T]`, sorting, direct `Map` iteration, and generic methods.
 4. Cleanup of unwound frames (so exceptions stop leaking), probably by checking a pending-exception flag after calls instead of `longjmp`.
 5. An explicit-stack drop to avoid deep recursion, and weak parameters and
    returns.
