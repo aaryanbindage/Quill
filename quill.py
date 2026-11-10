@@ -1049,28 +1049,14 @@ missing:
   ret ptr null
 }
 
-; ---- exceptions: a per-thread stack of setjmp frames ----
-; frame = { prev frame, (padding), jmp_buf at +16 }; @quill_exc holds the thrown
-; object (null for a runtime panic, whose message is in @quill_exc_text)
-@quill_top = thread_local global ptr null
+; ---- exceptions: a per-thread "pending" flag ----
+; Throwing sets the flag and every function unwinds by itself: after each call the
+; generated code checks the flag, releases its locals and returns, until a try block
+; takes the exception. @quill_exc holds the thrown object (null for a runtime panic,
+; whose message is in @quill_exc_text).
+@quill_pending = thread_local global i32 0
 @quill_exc = thread_local global ptr null
 @quill_exc_text = thread_local global ptr null
-
-define void @quill_throw() {
-  %f = load ptr, ptr @quill_top
-  %none = icmp eq ptr %f, null
-  br i1 %none, label %fatal, label %jump
-fatal:
-  call void @quill_uncaught()
-  call void @exit(i32 1)
-  unreachable
-jump:
-  %prev = load ptr, ptr %f
-  store ptr %prev, ptr @quill_top
-  %jb = getelementptr i8, ptr %f, i64 16
-  call void @longjmp(ptr %jb, i32 1)
-  unreachable
-}
 
 define ptr @quill_exc_msg() {
   %m = load ptr, ptr @quill_exc_text
@@ -1081,7 +1067,13 @@ define ptr @quill_exc_msg() {
 define void @quill_panic(ptr %msg) {
   store ptr null, ptr @quill_exc
   store ptr %msg, ptr @quill_exc_text
-  call void @quill_throw()
+  store i32 1, ptr @quill_pending
+  ret void
+}
+
+define void @quill_fatal() {
+  call void @quill_uncaught()
+  call void @exit(i32 1)
   unreachable
 }
 
@@ -1089,7 +1081,7 @@ define void @quill_panic_index(i64 %i, i64 %n) {
   %buf = call ptr @quill_alloc(i64 96)
   %r = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 96, ptr @.fmt.index, i64 %i, i64 %n)
   call void @quill_panic(ptr %buf)
-  unreachable
+  ret void
 }
 
 ; FNV-1a hash of a C string
@@ -1179,11 +1171,6 @@ RUNTIME += "\n" + cstr("@.fmt.panic", "error: %s\n") + "\n" + \
     cstr("@.fmt.index", "index %ld out of range (length %ld)") + "\n" + \
     cstr("@.fmt.uncaught", "error: uncaught exception: %s\n") + "\n" + \
     cstr("@.fmt.uncaught0", "error: uncaught exception\n") + "\n"
-
-# setjmp/longjmp: the mingw runtime wants the frame address as a second argument
-# of _setjmp, and passing null skips its SEH unwinding, which generated code lacks
-RUNTIME += ("declare i32 @_setjmp(ptr, ptr) returns_twice\n" if sys.platform == "win32"
-            else "declare i32 @_setjmp(ptr) returns_twice\n") + "declare void @longjmp(ptr, i32) noreturn\n"
 
 
 def split_top(s):
@@ -1669,12 +1656,21 @@ done:
   %sp = getelementptr ptr, ptr %vt, i64 {slot}
   %fn = load ptr, ptr %sp
   call void %fn(ptr %obj)
+  %pend = load i32, ptr @quill_pending
+  %thrown = icmp ne i32 %pend, 0
+  br i1 %thrown, label %fatal, label %ok
+fatal:
+  call void @quill_fatal()
+  unreachable
+ok:
   call void @quill_release_obj(ptr %obj)
   ret ptr null
 }}""")
         ret = "i32"
-        call = f'  %r = call i64 {mm.symbol}()\n  %c = trunc i64 %r to i32\n  ret i32 %c' if mm.ret == "int" \
-            else f'  call void {mm.symbol}()\n  ret i32 0'
+        check = ("  %pend = load i32, ptr @quill_pending\n  %thrown = icmp ne i32 %pend, 0\n"
+                 "  br i1 %thrown, label %fatal, label %ok\nfatal:\n  call void @quill_fatal()\n  unreachable\nok:\n")
+        call = f'  %r = call i64 {mm.symbol}()\n{check}  %c = trunc i64 %r to i32\n  ret i32 %c' if mm.ret == "int" \
+            else f'  call void {mm.symbol}()\n{check}  ret i32 0'
         out.append(f"define i32 @main() {{\n{call}\n}}")
         # string constants last (names are assigned while generating)
         consts = []
@@ -1685,6 +1681,15 @@ done:
         return "\n".join(consts + out) + "\n"
 
 
+@dataclass
+class Region:
+    """A try block being compiled: where its exceptions go, its finally block, and
+    the scope depth at which the block began."""
+    handler: str
+    final: list
+    depth: int
+
+
 class FuncGen:
     def __init__(self, mod, ci, mi):
         self.mod, self.ci, self.mi = mod, ci, mi
@@ -1693,9 +1698,10 @@ class FuncGen:
         self.scopes = [{}]
         self.terminated = False
         self.loops = []
-        self.tries = []          # frames of the try blocks being compiled, innermost last
-        self.uses_try = False
-        self.fresh = set()   # temps that hold an owned (+1) reference
+        self.tries = []          # the try blocks being compiled, innermost last
+        self.cleanup = []        # unwind blocks, appended after the function body
+        self.unwind_cache = {}
+        self.fresh = {}      # temps that hold an owned (+1) reference -> "str" or "obj"
 
     # ---- low-level helpers ----
     def tmp(self):
@@ -1755,28 +1761,98 @@ class FuncGen:
     def consume(self, v, t):
         """Take ownership of an expression result (retain if it was borrowed)."""
         if self.is_ref(t) and v in self.fresh:
-            self.fresh.discard(v)
+            self.fresh.pop(v, None)
         elif self.is_ref(t) and v != "null" and not v.startswith("getelementptr"):
             self.retain(v)
         return v
 
     def release_fresh(self, v, t):
         if v in self.fresh and self.is_ref(t):
-            self.fresh.discard(v)
+            self.fresh.pop(v, None)
             self.release(v, t)
 
     def upgrade(self, v, ty):
         """Read a weak slot: yields a fresh strong reference, or null if dead."""
         r = self.op(f"call ptr @quill_weak_upgrade(ptr {v})")
-        self.fresh.add(r)
+        self.fresh[r] = "obj"
         return r, ty[5:]
 
     def release_scope(self, sc):
         for ptr, ty in reversed(list(sc.values())):
-            if self.mod.is_weak(ty):
-                self.emit(f"call void @quill_weak_release(ptr {self.op(f'load ptr, ptr {ptr}')})")
-            elif self.is_ref(ty):
-                self.release(self.op(f"load ptr, ptr {ptr}"), ty)
+            self.release_var(ptr, ty, self.emit, self.op)
+
+    def release_var(self, ptr, ty, emit, op):
+        if self.mod.is_weak(ty):
+            emit(f"call void @quill_weak_release(ptr {op(f'load ptr, ptr {ptr}')})")
+        elif self.is_ref(ty):
+            fn = "quill_release_str" if ty == "str" else "quill_release_obj"
+            emit(f"call void @{fn}(ptr {op(f'load ptr, ptr {ptr}')})")
+
+    # ---- unwinding: how an exception leaves this function ----
+    def unwind_label(self):
+        """A label to branch to while an exception is pending: it releases the locals
+        declared since the innermost try began (or all of them), then continues at that
+        try's handler, or returns from the function."""
+        if self.tries:
+            target, floor = self.tries[-1].handler, self.tries[-1].depth
+        else:
+            target, floor = self.exit_label(), 0
+        label = target
+        for sc in self.scopes[floor:]:
+            for ptr, ty in sc.values():
+                if not (self.mod.is_weak(ty) or self.is_ref(ty)):
+                    continue
+                key = (ptr, label)
+                if key not in self.unwind_cache:
+                    name = self.label("unw")
+                    lines = []
+                    n = [0]
+
+                    def op(text, lines=lines, n=n, name=name):
+                        n[0] += 1
+                        t = f"%{name}.{n[0]}"
+                        lines.append(f"  {t} = {text}")
+                        return t
+
+                    self.release_var(ptr, ty, lambda text, lines=lines: lines.append("  " + text), op)
+                    self.cleanup.append(f"{name}:\n" + "\n".join(lines) + f"\n  br label %{label}")
+                    self.unwind_cache[key] = name
+                label = self.unwind_cache[key]
+        return label
+
+    def exit_label(self):
+        if "exit" not in self.unwind_cache:
+            ret = self.mod.llty(self.mi.ret)
+            zero = {"void": None, "i64": "0", "double": "0.0", "i1": "false", "ptr": "null"}[ret]
+            name = self.label("unw.exit")
+            self.cleanup.append(f"{name}:\n  " + ("ret void" if ret == "void" else f"ret {ret} {zero}"))
+            self.unwind_cache["exit"] = name
+        return self.unwind_cache["exit"]
+
+    def check_pending(self):
+        """After a call: if it threw, unwind."""
+        flag = self.op("icmp ne i32 " + self.op("load i32, ptr @quill_pending") + ", 0")
+        ok = self.label("ok")
+        if self.fresh:
+            site = self.label("unw.site")
+            self.condbr(flag, site, ok)
+            self.place(site)
+            self.leave_by_exception()
+        else:
+            self.condbr(flag, self.unwind_label(), ok)
+        self.place(ok)
+
+    def leave_by_exception(self):
+        """Release the temporaries still owned by the expression being evaluated,
+        then take the unwind path."""
+        for v, kind in list(self.fresh.items()):
+            self.release(v, kind)
+        self.br(self.unwind_label())
+
+    def raise_pending(self):
+        """The exception is set up; leave through the unwind path."""
+        self.emit("store i32 1, ptr @quill_pending")
+        self.leave_by_exception()
 
     def release_from(self, depth):
         if not self.terminated:
@@ -1828,9 +1904,8 @@ class FuncGen:
         if not self.terminated:
             zero = {"void": None, "i64": "0", "double": "0.0", "i1": "false", "ptr": "null"}[ret]
             self.emit("ret void" if ret == "void" else f"ret {ret} {zero}")
-        attrs = " optnone noinline" if self.uses_try else ""    # keep locals in memory across longjmp
-        return (f'define {ret} {mi.symbol}({sig}){attrs} {{\nentry:\n'
-                + "\n".join(self.allocas + self.lines) + "\n}")
+        return (f'define {ret} {mi.symbol}({sig}) {{\nentry:\n'
+                + "\n".join(self.allocas + self.lines + self.cleanup) + "\n}")
 
     # ---- statements ----
     def block(self, stmts):
@@ -1973,21 +2048,19 @@ class FuncGen:
 
     def leave(self, try_depth, scope_depth):
         """Control leaves early (return, break, continue): release the scopes it
-        skips, unlink the try frames above `try_depth` and run their finally blocks,
+        skips and run the finally blocks of the try statements above `try_depth`,
         innermost first. A finally block may itself end the flow (return, throw)."""
         if self.terminated:
             return
         scopes, tries = self.scopes, self.tries
         hi = len(scopes)
         for k in range(len(tries) - 1, try_depth - 1, -1):
-            frame, final, sd = tries[k]
-            self.release_range(sd, hi, scopes)
-            hi = sd
-            prev = self.op(f"load ptr, ptr {frame}")
-            self.emit(f"store ptr {prev}, ptr @quill_top")
-            if final is not None:
-                self.scopes, self.tries = scopes[:sd], tries[:k]
-                self.block(final)
+            region = tries[k]
+            self.release_range(region.depth, hi, scopes)
+            hi = region.depth
+            if region.final is not None:
+                self.scopes, self.tries = scopes[:region.depth], tries[:k]
+                self.block(region.final)
                 self.scopes, self.tries = scopes, tries
                 if self.terminated:
                     return
@@ -2000,76 +2073,49 @@ class FuncGen:
         self.null_check(v, "cannot throw null")
         self.consume(v, t)                       # the exception slot owns the reference
         self.emit(f"store ptr {v}, ptr @quill_exc")
-        self.emit("call void @quill_throw()")
-        self.emit("unreachable")
-        self.terminated = True
-
-    def push_frame(self):
-        """Link a new exception frame and run setjmp; returns (frame, i1 'first time')."""
-        self.uses_try = True
-        frame = self.alloca("[66 x i64], align 16", "exc.frame")
-        prev = self.op("load ptr, ptr @quill_top")
-        self.emit(f"store ptr {prev}, ptr {frame}")
-        self.emit(f"store ptr {frame}, ptr @quill_top")
-        jb = self.op(f"getelementptr i8, ptr {frame}, i64 16")
-        call = f"call i32 @_setjmp(ptr {jb}, ptr null)" if sys.platform == "win32" else f"call i32 @_setjmp(ptr {jb})"
-        r = self.op(call + " returns_twice")
-        return frame, self.op(f"icmp eq i32 {r}, 0")
+        self.raise_pending()
 
     def s_Try(self, s):
         if s.final is None:
             return self.try_catch(s.body, s.catches, s)
-        # try/finally: an outer frame catches whatever escapes, runs the finally
-        # block, then throws it again; normal exits and return/break/continue run
-        # the same block inline (see leave)
-        frame, first = self.push_frame()
-        body, handler, end = self.label("fin.body"), self.label("fin.catch"), self.label("fin.end")
-        self.condbr(first, body, handler)
-        self.place(body)
-        self.tries.append((frame, s.final, len(self.scopes)))
+        # try/finally: whatever escapes is parked, the finally block runs, and the
+        # exception continues; normal exits and return/break/continue run the same
+        # block inline (see leave)
+        handler, end = self.label("fin.catch"), self.label("fin.end")
+        self.tries.append(Region(handler, s.final, len(self.scopes)))
         if s.catches:
             self.try_catch(s.body, s.catches, s)
         else:
             self.block(s.body)
         self.tries.pop()
         if not self.terminated:
-            back = self.op(f"load ptr, ptr {frame}")
-            self.emit(f"store ptr {back}, ptr @quill_top")
             self.block(s.final)
         self.br(end)
         self.place(handler)
-        # keep the in-flight exception (object or panic text) safe across the finally block
         exc, txt = self.alloca("ptr", "fin.exc"), self.alloca("ptr", "fin.txt")
         self.emit(f"store ptr {self.op('load ptr, ptr @quill_exc')}, ptr {exc}")
         self.emit(f"store ptr {self.op('load ptr, ptr @quill_exc_text')}, ptr {txt}")
+        self.emit("store i32 0, ptr @quill_pending")
         self.block(s.final)
         if not self.terminated:
             self.emit(f"store ptr {self.op(f'load ptr, ptr {exc}')}, ptr @quill_exc")
             self.emit(f"store ptr {self.op(f'load ptr, ptr {txt}')}, ptr @quill_exc_text")
-            self.emit("call void @quill_throw()")
-            self.emit("unreachable")
-            self.terminated = True
+            self.raise_pending()
         self.place(end)
 
     def try_catch(self, body_stmts, catches, s):
-        frame, first = self.push_frame()
-        body, handler, end = self.label("try.body"), self.label("try.catch"), self.label("try.end")
-        self.condbr(first, body, handler)
-
-        self.place(body)
-        self.tries.append((frame, None, len(self.scopes)))
+        handler, end = self.label("try.catch"), self.label("try.end")
+        self.tries.append(Region(handler, None, len(self.scopes)))
         self.block(body_stmts)
         self.tries.pop()
-        if not self.terminated:
-            back = self.op(f"load ptr, ptr {frame}")
-            self.emit(f"store ptr {back}, ptr @quill_top")      # leaving normally: unlink
         self.br(end)
 
-        # a throw already unlinked the frame; pick up the exception
+        # an exception is pending: take it
         self.place(handler)
         slot = self.alloca("ptr", "exc")
         self.emit(f"store ptr {self.op('load ptr, ptr @quill_exc')}, ptr {slot}")
         self.emit("store ptr null, ptr @quill_exc")
+        self.emit("store i32 0, ptr @quill_pending")
         panic, have = self.label("exc.panic"), self.label("exc.have")
         self.condbr(self.op(f"icmp eq ptr {self.op(f'load ptr, ptr {slot}')}, null"), panic, have)
         self.place(panic)                        # a runtime panic: wrap its message in an Error
@@ -2098,11 +2144,9 @@ class FuncGen:
             self.scopes.pop()
             self.br(end)
             self.place(nxt)
-        # nothing matched: throw it again to the enclosing handler
+        # nothing matched: pass it on to the enclosing handler
         self.emit(f"store ptr {self.op(f'load ptr, ptr {slot}')}, ptr @quill_exc")
-        self.emit("call void @quill_throw()")
-        self.emit("unreachable")
-        self.terminated = True
+        self.raise_pending()
         self.place(end)
 
     def s_Break(self, s):
@@ -2239,7 +2283,7 @@ class FuncGen:
             self.null_check(rv, "null string (concatenation)")
             r = self.op(f"call ptr @quill_concat(ptr {lv}, ptr {rv})")
             self.release_fresh(lv, lt); self.release_fresh(rv, rt)
-            self.fresh.add(r)
+            self.fresh[r] = "str"
             return r, "str"
         if lt not in NUM or rt not in NUM:
             self.err(f"operator {e.op} not supported for {lt} and {rt}", e)
@@ -2366,7 +2410,7 @@ class FuncGen:
             val, ty = self.upgrade(val, ty)
         elif ov in self.fresh and self.is_ref(ty):   # field of a temporary object:
             self.retain(val)                         # keep it alive past the temp
-            self.fresh.add(val)
+            self.fresh[val] = "str" if ty == "str" else "obj"
         self.release_fresh(ov, ot)
         return val, ty
 
@@ -2382,7 +2426,7 @@ class FuncGen:
         size_p = self.op(f'getelementptr %"{ci.name}", ptr null, i32 1')
         size = self.op(f"ptrtoint ptr {size_p} to i64")
         obj = self.op(f"call ptr @quill_alloc(i64 {size})")
-        self.fresh.add(obj)
+        self.fresh[obj] = "obj"
         self.emit(f'store ptr @"vtable.{ci.name}", ptr {obj}')
         init = self.mod.find_class_method(ci, "init")
         if init:
@@ -2415,11 +2459,13 @@ class FuncGen:
         call = f"call {rt} {target}({', '.join(vals)})"
         if rt == "void":
             self.emit(call)
+            self.check_pending()
             res = (None, "void")
         else:
             r = self.op(call)
+            self.check_pending()
             if self.is_ref(mi.ret):
-                self.fresh.add(r)             # callee returns an owned reference
+                self.fresh[r] = "str" if mi.ret == "str" else "obj"   # callee returns an owned reference
             res = (r, mi.ret)
         for v, t in temps:
             self.release_fresh(v, t)
@@ -2466,15 +2512,13 @@ class FuncGen:
         self.condbr(cond, good, bad)
         self.place(bad)
         self.emit(f"call void @quill_panic(ptr {self.mod.string(msg)})")
-        self.emit("unreachable")
-        self.terminated = True
+        self.raise_pending()
         self.place(good)
 
     def null_check(self, v, msg):
         if v == "null":
             self.emit(f"call void @quill_panic(ptr {self.mod.string(msg)})")
-            self.emit("unreachable")
-            self.terminated = True
+            self.raise_pending()
             self.place(self.label("after.null"))
             return
         self.panic_unless(self.op(f"icmp ne ptr {v}, null"), msg)
@@ -2485,8 +2529,7 @@ class FuncGen:
         self.condbr(self.op(f"icmp ult i64 {idx}, {n}"), good, bad)   # unsigned: also rejects negatives
         self.place(bad)
         self.emit(f"call void @quill_panic_index(i64 {idx}, i64 {n})")
-        self.emit("unreachable")
-        self.terminated = True
+        self.raise_pending()
         self.place(good)
 
     def elem_ptr(self, arr, idx, et):
@@ -2503,7 +2546,7 @@ class FuncGen:
         size = "1" if ci.elem == "bool" else "8"
         total = self.op(f"add i64 {self.op(f'mul i64 {nv}, {size}')}, 16")
         obj = self.op(f"call ptr @quill_alloc(i64 {total})")
-        self.fresh.add(obj)
+        self.fresh[obj] = "obj"
         self.emit(f'store ptr @"vtable.{ci.name}", ptr {obj}')
         self.emit(f"store i64 {nv}, ptr {self.op(f'getelementptr i8, ptr {obj}, i64 8')}")
         return obj, ci.name
@@ -2520,7 +2563,7 @@ class FuncGen:
             val = self.op(f"load {self.mod.llty(et)}, ptr {self.elem_ptr(ov, iv, et)}")
             if ov in self.fresh and self.is_ref(et):      # element of a temporary array
                 self.retain(val)
-                self.fresh.add(val)
+                self.fresh[val] = "str" if et == "str" else "obj"
             self.release_fresh(ov, ot)
             return val, et
         if not (self.mod.is_class(ot) and self.mod.find_method(self.mod.classes[ot], "get")):
@@ -2604,11 +2647,13 @@ class FuncGen:
             call = f"call {'i64' if ret == 'int' else 'ptr' if ret == 'str' else 'void'} @{fn}({', '.join(vals)})"
             if ret == "str":
                 r = self.op(call)
-                self.fresh.add(r)           # the runtime hands over an owned string
+                self.fresh[r] = "str"       # the runtime hands over an owned string
                 return r, "str"
             if ret == "int":
                 return self.op(call), "int"
             self.emit(call)
+            if fn == "quill_panic":
+                self.raise_pending()
             return None, "void"
         if name == "hash" and len(e.args) == 1:
             v, t = self.expr(e.args[0])
@@ -2630,7 +2675,7 @@ class FuncGen:
                 buf = self.op("call ptr @quill_alloc(i64 40)")
                 fmt, arg = ("%ld", f"i64 {v}") if t == "int" else ("%g", f"double {v}")
                 self.emit(f"call i32 (ptr, i64, ptr, ...) @snprintf(ptr {buf}, i64 40, ptr {self.mod.string(fmt)}, {arg})")
-                self.fresh.add(buf)
+                self.fresh[buf] = "str"
                 return buf, "str"
             if t == "bool":
                 return self.op(f"select i1 {v}, ptr {self.mod.string('true')}, ptr {self.mod.string('false')}"), "str"
@@ -2683,14 +2728,14 @@ class FuncGen:
         self.br(end)
         self.place(no)
         r, _ = self.call_method(v, t, "toString", [], node)
-        self.fresh.discard(r)
+        self.fresh.pop(r, None)
         self.emit(f"store ptr {r}, ptr {slot}")
         self.br(end)
         self.place(end)
         out = self.op(f"load ptr, ptr {slot}")
         # the object branch yields an owned string; the null branch an immortal literal
         # (immortal strings ignore release), so treat the result as fresh either way
-        self.fresh.add(out)
+        self.fresh[out] = "str"
         return out
 
     def print_(self, e):

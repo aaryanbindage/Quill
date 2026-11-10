@@ -543,8 +543,10 @@ class Main:
   prints `error: uncaught exception: <message>` and exits with status 1 (runtime
   errors print `error: <message>` as before).
 - `return`, `break` and `continue` may leave a `try` block.
-- Locals owned by the frames an exception unwinds are not released (see the
-  roadmap).
+- Unwinding is clean: every function an exception passes through releases its
+  parameters, locals and in-flight temporaries as it goes, so nothing leaks.
+  Resources that are not memory are not released automatically; a `Mutex` locked
+  inside a `try` stays locked unless a `finally` unlocks it.
 
 ### `finally`
 
