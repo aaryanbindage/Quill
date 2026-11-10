@@ -23,7 +23,9 @@ class Main:
 
 ## Usage
 
-Requires Python 3 and `clang` (no other dependencies).
+Requires Python 3 and `clang` (no other dependencies). On Windows it also needs
+`gcc` from a MinGW-w64 toolchain (such as w64devkit or winlibs) on `PATH`, which
+links the program; `--sanitize` is not available there.
 
 ```
 python3 quill.py run   file.ql            # compile and run

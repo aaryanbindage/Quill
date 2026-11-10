@@ -11,6 +11,7 @@ import copy
 import dataclasses
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -30,7 +31,7 @@ KEYWORDS = {
     "class", "def", "static", "return", "if", "elif", "else",
     "while", "for", "in", "new", "self", "true", "false", "null", "and",
     "or", "not", "break", "continue", "pass", "weak",
-    "public", "private", "abstract", "interface", "super",
+    "public", "private", "abstract", "interface", "super", "instanceof", "as",
 }
 
 TOKEN_RE = re.compile(r'''
@@ -158,6 +159,10 @@ class Call(N): callee: N; args: list
 class New(N): cls: str; args: list
 @dataclass
 class Index(N): obj: N; index: N
+@dataclass
+class InstanceOf(N): e: N; cls: str
+@dataclass
+class Cast(N): e: N; cls: str
 @dataclass
 class Block(N): body: list   # internal: a statement list with its own scope
 @dataclass
@@ -438,10 +443,15 @@ class Parser:
 
     def cmp(self):
         l = self.add()
-        while self.is_("OP") and self.tok.val in ("==", "!=", "<", "<=", ">", ">="):
-            t = self.next()
-            l = Binary(t.val, l, self.add(), line=t.line)
-        return l
+        while True:
+            if self.is_("OP") and self.tok.val in ("==", "!=", "<", "<=", ">", ">="):
+                t = self.next()
+                l = Binary(t.val, l, self.add(), line=t.line)
+            elif self.is_("KW", "instanceof"):
+                t = self.next()
+                l = InstanceOf(l, self.expect("NAME").val, line=t.line)
+            else:
+                return l
 
     def add(self):
         l = self.mul()
@@ -461,7 +471,11 @@ class Parser:
         if self.is_("OP", "-"):
             t = self.next()
             return Unary("-", self.unary(), line=t.line)
-        return self.postfix()
+        e = self.postfix()
+        while self.is_("KW", "as"):
+            t = self.next()
+            e = Cast(e, self.expect("NAME").val, line=t.line)
+        return e
 
     def postfix(self):
         e = self.primary()
@@ -783,6 +797,7 @@ RUNTIME = r'''
 declare i32 @printf(ptr, ...)
 declare i64 @strlen(ptr)
 declare i32 @strcmp(ptr, ptr)
+declare i32 @snprintf(ptr, i64, ptr, ...)
 declare ptr @calloc(i64, i64)
 declare void @free(ptr)
 declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
@@ -1820,6 +1835,8 @@ class FuncGen:
         if e.op in ("==", "!=", "<", "<=", ">", ">="):
             return self.compare(e, lv, lt, rv, rt)
         if e.op == "+" and lt == "str" and rt == "str":
+            self.null_check(lv, "null string (concatenation)")
+            self.null_check(rv, "null string (concatenation)")
             r = self.op(f"call ptr @quill_concat(ptr {lv}, ptr {rv})")
             self.release_fresh(lv, lt); self.release_fresh(rv, rt)
             self.fresh.add(r)
@@ -1858,6 +1875,50 @@ class FuncGen:
             return r, "bool"
         self.err(f"cannot compare {lt} and {rt}", e)
 
+    def type_test(self, v, cls, node):
+        """i1: v is non-null and its dynamic class is cls or a subclass/implementer."""
+        if cls not in self.mod.classes or self.mod.classes[cls].elem is not None:
+            self.err(f"unknown class {cls}", node)
+        impls = [ci for ci in self.mod.classes.values()
+                 if not ci.is_interface and self.mod.concrete(ci) and ci.elem is None
+                 and self.mod.is_subclass(ci.name, cls)]
+        res = self.alloca("i1", "io")
+        self.emit(f"store i1 false, ptr {res}")
+        nn, chk, end = self.label("io.nn"), self.label("io.chk"), self.label("io.end")
+        self.condbr(self.op(f"icmp ne ptr {v}, null"), nn, end)
+        self.place(nn)
+        vt = self.op(f"load ptr, ptr {v}")
+        acc = "false"
+        for ci in impls:
+            hit = self.op(f'icmp eq ptr {vt}, @"vtable.{ci.name}"')
+            acc = self.op(f"or i1 {acc}, {hit}")
+        self.emit(f"store i1 {acc}, ptr {res}")
+        self.br(end)
+        self.place(end)
+        return self.op(f"load i1, ptr {res}")
+
+    def e_InstanceOf(self, e):
+        v, t = self.expr(e.e)
+        if not self.mod.is_class(t):
+            self.err(f"instanceof needs an object, got {t}", e)
+        r = self.type_test(v, e.cls, e)
+        self.release_fresh(v, t)
+        return r, "bool"
+
+    def e_Cast(self, e):
+        v, t = self.expr(e.e)
+        if not self.mod.is_class(t):
+            self.err(f"cannot cast {t} to {e.cls}", e)
+        if e.cls not in self.mod.classes:
+            self.err(f"unknown class {e.cls}", e)
+        either_iface = self.mod.classes[t].is_interface or self.mod.classes[e.cls].is_interface
+        if not (either_iface or self.mod.is_subclass(t, e.cls) or self.mod.is_subclass(e.cls, t)):
+            self.err(f"cannot cast {t} to {e.cls}: the types are unrelated", e)
+        isnull = self.op(f"icmp eq ptr {v}, null")
+        ok = self.op(f"or i1 {isnull}, {self.type_test(v, e.cls, e)}")   # null casts to null
+        self.panic_unless(ok, f"invalid cast to {e.cls}")
+        return v, e.cls          # same reference, same ownership, narrower static type
+
     def short_circuit(self, e):
         slot = self.alloca("i1", "sc")
         lv = self.cond(e.l)
@@ -1875,6 +1936,7 @@ class FuncGen:
         ov, ot = self.expr(e.obj)
         if not self.mod.is_class(ot):
             self.err(f"{ot} has no fields", e)
+        self.null_check(ov, "null pointer dereference")
         ci = self.mod.classes[ot]
         if ci.elem is not None:
             if e.name != "length":
@@ -1991,6 +2053,7 @@ class FuncGen:
         if mi.static:
             self.err(f"{name} is static; call it as {mi.owner}.{name}(...)", node)
         self.check_access(mi, node)
+        self.null_check(ov, f"null pointer dereference (calling {name})")
         res = self.call_args(mi, ov, args, node, recv_ci=ci,
                              virtual=(not mi.is_iface) and name in ci.vtable,
                              iface=mi.is_iface)
@@ -2006,6 +2069,15 @@ class FuncGen:
         self.emit("unreachable")
         self.terminated = True
         self.place(good)
+
+    def null_check(self, v, msg):
+        if v == "null":
+            self.emit(f"call void @quill_panic(ptr {self.mod.string(msg)})")
+            self.emit("unreachable")
+            self.terminated = True
+            self.place(self.label("after.null"))
+            return
+        self.panic_unless(self.op(f"icmp ne ptr {v}, null"), msg)
 
     def bounds_check(self, idx, arr):
         n = self.op(f"load i64, ptr {self.op(f'getelementptr i8, ptr {arr}, i64 8')}")
@@ -2043,6 +2115,7 @@ class FuncGen:
             iv, it = self.expr(e.index)
             if it != "int":
                 self.err("index must be int", e)
+            self.null_check(ov, "null pointer dereference (indexing)")
             self.bounds_check(iv, ov)
             val = self.op(f"load {self.mod.llty(et)}, ptr {self.elem_ptr(ov, iv, et)}")
             if ov in self.fresh and self.is_ref(et):      # element of a temporary array
@@ -2069,6 +2142,7 @@ class FuncGen:
         v, vt = self.expr(s.value)
         self.consume(v, vt)
         v = self.coerce(v, vt, et, s, "array element")
+        self.null_check(ov, "null pointer dereference (indexing)")
         self.bounds_check(iv, ov)
         p = self.elem_ptr(ov, iv, et)
         old = self.op(f"load ptr, ptr {p}") if self.is_ref(et) else None
@@ -2144,15 +2218,32 @@ class FuncGen:
             return r, "int"
         if name == "heap_live" and not e.args:      # debugging aid: live heap objects
             return self.op("load i64, ptr @quill_live"), "int"
+        if name == "str" and len(e.args) == 1:
+            v, t = self.expr(e.args[0])
+            if t == "str":
+                return v, t
+            if t in ("int", "float"):
+                buf = self.op("call ptr @quill_alloc(i64 40)")
+                fmt, arg = ("%ld", f"i64 {v}") if t == "int" else ("%g", f"double {v}")
+                self.emit(f"call i32 (ptr, i64, ptr, ...) @snprintf(ptr {buf}, i64 40, ptr {self.mod.string(fmt)}, {arg})")
+                self.fresh.add(buf)
+                return buf, "str"
+            if t == "bool":
+                return self.op(f"select i1 {v}, ptr {self.mod.string('true')}, ptr {self.mod.string('false')}"), "str"
+            if self.has_to_string(t):
+                return self.to_str(v, t, e), "str"
+            self.err(f"cannot convert {t} to str (give the class a toString method)", e)
         if name in ("int", "float", "len") and len(e.args) == 1:
             v, t = self.expr(e.args[0])
             if name == "len" and self.mod.is_class(t):
                 if self.mod.array_elem(t) is not None:
+                    self.null_check(v, "null pointer dereference (len)")
                     r = self.op(f"load i64, ptr {self.op(f'getelementptr i8, ptr {v}, i64 8')}")
                     self.release_fresh(v, t)
                     return r, "int"
                 return self.call_method(v, t, "size", [], e)
             if name == "len" and t == "str":
+                self.null_check(v, "null string (len)")
                 r = self.op(f"call i64 @strlen(ptr {v})")
                 self.release_fresh(v, t)
                 return r, "int"
@@ -2163,6 +2254,41 @@ class FuncGen:
             self.err(f"cannot apply {name}() to {t}", e)
         self.err(f"unknown function {name} (all code lives in classes)", e)
 
+    def has_to_string(self, t):
+        if not self.mod.is_class(t):
+            return False
+        mi = self.mod.find_method(self.mod.classes[t], "toString")
+        return bool(mi and not mi.static and not mi.params and mi.ret == "str"
+                    and (mi.access != "private" or self.ci.name == mi.owner))
+
+    def print_to_string(self, v, t, pf, node):
+        """Print an object through its toString(), or <null> when it is null."""
+        s = self.to_str(v, t, node)
+        pf("%s", ("ptr", s))
+        self.release_fresh(s, "str")
+        self.release_fresh(v, t)
+
+    def to_str(self, v, t, node):
+        """Convert a value to a fresh-or-borrowed str using toString for objects."""
+        slot = self.alloca("ptr", "ts")
+        isnull = self.op(f"icmp eq ptr {v}, null")
+        yes, no, end = self.label("ts.null"), self.label("ts.obj"), self.label("ts.end")
+        self.condbr(isnull, yes, no)
+        self.place(yes)
+        self.emit(f"store ptr {self.mod.string('null')}, ptr {slot}")
+        self.br(end)
+        self.place(no)
+        r, _ = self.call_method(v, t, "toString", [], node)
+        self.fresh.discard(r)
+        self.emit(f"store ptr {r}, ptr {slot}")
+        self.br(end)
+        self.place(end)
+        out = self.op(f"load ptr, ptr {slot}")
+        # the object branch yields an owned string; the null branch an immortal literal
+        # (immortal strings ignore release), so treat the result as fresh either way
+        self.fresh.add(out)
+        return out
+
     def print_(self, e):
         def pf(fmt, *args):
             a = "".join(f", {t} {v}" for t, v in args)
@@ -2172,10 +2298,14 @@ class FuncGen:
             if i: pf(" ")
             if t == "int": pf("%ld", ("i64", v))
             elif t == "float": pf("%g", ("double", v))
-            elif t == "str": pf("%s", ("ptr", v))
+            elif t == "str":
+                pf("%s", ("ptr", self.op(f"select i1 {self.op(f'icmp eq ptr {v}, null')}, ptr {self.mod.string('null')}, ptr {v}")))
             elif t == "bool":
                 s = self.op(f"select i1 {v}, ptr {self.mod.string('true')}, ptr {self.mod.string('false')}")
                 pf("%s", ("ptr", s))
+            elif self.has_to_string(t):
+                self.print_to_string(v, t, pf, a)
+                continue
             else: pf(f"<{t} object at %p>", ("ptr", v))
             self.release_fresh(v, t)
         pf("\n")
@@ -2196,6 +2326,50 @@ def mark_sanitize(ir, kind):
     return re.sub(r"^(define [^\n]*) \{$", r"\1 " + attr + " {", ir, flags=re.M)
 
 
+WIN_SHIM = """#include <stdarg.h>
+#include <stdio.h>
+#include <io.h>
+int dprintf(int fd, const char *fmt, ...) {
+    char buf[1024];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof buf - 1) n = sizeof buf - 1;
+    return n < 0 ? n : _write(fd, buf, n);
+}
+"""
+
+
+def find_tool(name):
+    """Locate a tool on PATH, falling back to the default Windows LLVM install."""
+    found = shutil.which(name)
+    if found:
+        return found
+    fallback = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "LLVM", "bin", name + ".exe")
+    return fallback if os.path.exists(fallback) else name
+
+
+def build_windows(ll, out, opt):
+    """The runtime uses POSIX calls (pthreads, dprintf), so on Windows compile with
+    clang for the mingw target and link with gcc plus a dprintf shim."""
+    with tempfile.TemporaryDirectory() as d:
+        shim = os.path.join(d, "shim.c")
+        with open(shim, "w") as f:
+            f.write(WIN_SHIM)
+        obj = os.path.join(d, "prog.o")
+        r = subprocess.run([find_tool("clang"), opt, "-c", "--target=x86_64-w64-mingw32",
+                            "-Wno-override-module", ll, "-o", obj],
+                           capture_output=True, text=True)
+        if r.returncode:
+            return r
+        exe = out if out.endswith(".exe") else out + ".exe"
+        r = subprocess.run(["gcc", obj, shim, "-o", exe, "-lpthread"],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and exe != out:
+            os.replace(exe, out)
+        return r
+
+
 def build(path, out, opt="-O1", keep_ll=False, sanitize=None):
     with open(path) as f:
         src = f.read()
@@ -2210,8 +2384,14 @@ def build(path, out, opt="-O1", keep_ll=False, sanitize=None):
     with open(ll, "w") as f:
         f.write(ir)
     flags = [f"-fsanitize={sanitize}", "-g"] if sanitize else []
-    r = subprocess.run(["clang", opt, *flags, "-Wno-override-module", ll, "-o", out],
-                       capture_output=True, text=True)
+    if sys.platform == "win32":
+        if sanitize:
+            print("error: --sanitize is not supported on Windows", file=sys.stderr)
+            sys.exit(2)
+        r = build_windows(ll, out, opt)
+    else:
+        r = subprocess.run(["clang", opt, *flags, "-Wno-override-module", ll, "-o", out],
+                           capture_output=True, text=True)
     if not keep_ll:
         os.unlink(ll)
     if r.returncode:

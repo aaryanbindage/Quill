@@ -21,7 +21,7 @@ class Main:
 - Strings use double quotes with escapes `\n \t \r \0 \\ \"`.
 - Keywords: `class def static return if elif else while for in new self true
   false null and or not break continue pass weak
-  public private abstract interface super`.
+  public private abstract interface super instanceof as`.
 
 ## Types
 
@@ -350,7 +350,8 @@ for name in ages.keys():
 
 | Call           | Result                                              |
 |----------------|-----------------------------------------------------|
-| `print(a, b)`  | Prints arguments separated by spaces, then a newline. Works on `int`, `float`, `bool`, `str`; objects print as `<Class object at 0x...>`. |
+| `print(a, b)`  | Prints arguments separated by spaces, then a newline. Works on `int`, `float`, `bool`, `str`; objects print through their `toString()` if they define a public one, otherwise as `<Class object at 0x...>`. A `null` object or `str` prints as `null`. |
+| `str(x)`       | converts an `int`, `float`, `bool` or object (via `toString()`) to `str`; `null` becomes `"null"` |
 | `int(x)`       | `float` truncated, `bool` to 0/1, or `int` unchanged |
 | `float(x)`     | `int` or `float` to `float`                          |
 | `len(x)`       | length of a `str` in bytes; number of elements of an `Array`, or of a class with `size()` |
@@ -453,6 +454,31 @@ A class may define `def deinit(self)`. It runs just before the object's fields
 are released, when the last strong reference goes away. Only the nearest
 `deinit` in the inheritance chain runs (a subclass does not call its parent's
 automatically). `Mutex` uses this to free its lock.
+
+## Type tests and casts, `toString`
+
+`x instanceof T` is `true` when `x` is not `null` and its runtime class is `T`,
+a subclass of `T`, or implements the interface `T`.
+
+`x as T` narrows or widens the static type. It stops the program with
+`error: invalid cast to T` if `x` is not a `T`; `null` casts to `null`. The
+compiler rejects casts between unrelated classes (interfaces are always allowed,
+since a subclass might implement them).
+
+```python
+if a instanceof Dog:
+    d: Dog = a as Dog
+    print(d.bark())
+```
+
+A class that defines `def toString(self) -> str` is printed through it by
+`print`, and `str(obj)` calls it.
+
+## Null checks
+
+Reading or writing a field, calling a method, indexing, or taking `len` of a
+`null` value stops the program with `error: null pointer dereference` and exit
+status 1 instead of crashing. Concatenating a `null` string is checked the same way.
 
 ## Errors
 
