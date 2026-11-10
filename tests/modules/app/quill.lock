@@ -1,0 +1,9 @@
+# quill.lock: written by `quill install`. Commit it; do not edit it.
+lock 1
+
+pinned mathx 1.2.0
+    from path ../mathx
+
+pinned shapes 1.0.3
+    from path ../shapes
+    needs mathx

@@ -21,7 +21,7 @@ class Main:
 - Strings use double quotes with escapes `\n \t \r \0 \\ \"`.
 - Keywords: `class def static return if elif else while for in new self true
   false null and or not break continue pass weak
-  public private abstract interface super instanceof as`.
+  public private abstract interface super instanceof as try catch finally throw bring`.
 
 ## Types
 
@@ -334,6 +334,27 @@ for name in ages.keys():
   over them is safe; the loop just won't see the changes.
 - You cannot loop over a `Map` directly; loop over `m.keys()` or `m.values()`.
 
+## List and map literals
+
+```python
+primes = [2, 3, 5, 7]                         # List[int]
+ratios: List[float] = [1, 2.5]                # ints widen to float
+pets: List[Animal] = [new Dog("Rex"), new Cat("Tom")]
+ages = {"ann" -> 31, "bo" -> 27}              # Map[str,int]
+index = {"evens" -> [2, 4], "odds" -> [1, 3]} # Map[str,List[int]]
+none: Map[str, int] = {}
+```
+
+A map entry is written `key -> value`; the arrow is the same one used for
+return types. Literals may span several lines and end with a trailing comma.
+
+The element type is taken from the declared type when there is one (variable,
+field assignment, parameter or return type), otherwise from the elements: all
+the same type, `int` mixed with `float` (giving `float`), or a type every other
+element can be assigned to. `null` elements are allowed for `str` and classes.
+An empty `[]` or `{}` needs a declared type. A literal builds a new `List` or
+`Map`, so a repeated map key keeps its last value.
+
 ## Indexing and `for` loops
 
 - `x[i]` on an `Array` reads an element. On any other class it calls
@@ -479,6 +500,72 @@ A class that defines `def toString(self) -> str` is printed through it by
 Reading or writing a field, calling a method, indexing, or taking `len` of a
 `null` value stops the program with `error: null pointer dereference` and exit
 status 1 instead of crashing. Concatenating a `null` string is checked the same way.
+
+## Splitting a program: `bring`
+
+`bring util.text` at the top of a file loads `util/text.ql`, and `bring shapes`
+loads a package you depend on. Classes from brought files are used by their plain
+names. Details, and the package manager, are in [Modules and packages](packages.md).
+
+## Exceptions
+
+`throw` raises any object. `try` runs a block, and the first `catch` clause
+whose class matches the thrown object (the class itself, a subclass, or an
+implementer of an interface) handles it. A bare `catch:` takes anything.
+
+```python
+class NotFound < Error:
+    def init(self, what: str):
+        super.init(what + " not found")
+
+class Main:
+    static def find(i: int) -> int:
+        if i < 0:
+            throw new NotFound("item")
+        return i
+
+    static def main():
+        try:
+            print(Main.find(-1))
+        catch NotFound as e:
+            print("caught:", e.message)
+        catch Error as e:        # also receives runtime errors, see below
+            print("other:", e.message)
+```
+
+- `Error` is a built-in class with a `message: str` field. Subclass it for your
+  own exceptions; any other class can be thrown too.
+- Runtime errors (list or array index out of range, missing map key, `null`
+  dereference, bad cast, ...) are thrown as an `Error` whose message is the
+  panic text, so `catch Error as e` handles them.
+- A clause with no match passes the exception on to the enclosing `try`; a
+  `throw` inside a `catch` block does the same. An exception nobody catches
+  prints `error: uncaught exception: <message>` and exits with status 1 (runtime
+  errors print `error: <message>` as before).
+- `return`, `break` and `continue` may leave a `try` block.
+- Unwinding is clean: every function an exception passes through releases its
+  parameters, locals and in-flight temporaries as it goes, so nothing leaks.
+  Resources that are not memory are not released automatically; a `Mutex` locked
+  inside a `try` stays locked unless a `finally` unlocks it.
+
+### `finally`
+
+A `finally` block runs however the `try` ends: normal completion, after a
+`catch` clause, when an exception propagates (unmatched, or thrown from a
+`catch` block), and when `return`, `break` or `continue` leaves the block. A
+`try` needs at least one `catch` or a `finally`.
+
+```python
+f: File = new File("data.txt")
+try:
+    f.process()
+finally:
+    f.close()          # runs even if process() throws or returns
+```
+
+When several `try` blocks are left at once, their `finally` blocks run
+innermost first. A `return` or `throw` inside `finally` replaces whatever was
+in flight.
 
 ## Errors
 

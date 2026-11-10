@@ -1,0 +1,5 @@
+package shapes
+version 1.0.3
+source src
+
+needs mathx 1.0 at path ../mathx

@@ -16,13 +16,15 @@ import struct
 import subprocess
 import sys
 import tempfile
+
+import quillpkg
 from dataclasses import dataclass, field
 
 
 class CompileError(Exception):
-    def __init__(self, msg, line=0):
+    def __init__(self, msg, line=0, file=None):
         super().__init__(msg)
-        self.msg, self.line = msg, line
+        self.msg, self.line, self.file = msg, line, file
 
 
 # ───────────────────────────── Lexer ─────────────────────────────
@@ -32,6 +34,7 @@ KEYWORDS = {
     "while", "for", "in", "new", "self", "true", "false", "null", "and",
     "or", "not", "break", "continue", "pass", "weak",
     "public", "private", "abstract", "interface", "super", "instanceof", "as",
+    "try", "catch", "finally", "throw", "bring",
 }
 
 TOKEN_RE = re.compile(r'''
@@ -41,7 +44,7 @@ TOKEN_RE = re.compile(r'''
     (?P<INT>\d+) |
     (?P<STR>"(?:[^"\\\n]|\\.)*") |
     (?P<NAME>[A-Za-z_]\w*) |
-    (?P<OP>->|==|!=|<=|>=|\+=|-=|\*=|/=|%=|[-+*/%<>=(),.:\[\]])
+    (?P<OP>->|==|!=|<=|>=|\+=|-=|\*=|/=|%=|[-+*/%<>=(),.:{}\[\]])
 ''', re.X)
 
 ESCAPES = {"n": "\n", "t": "\t", "\\": "\\", '"': '"', "0": "\0", "r": "\r"}
@@ -109,15 +112,15 @@ def lex(src):
             elif kind == "NAME":
                 toks.append(Tok("KW" if text in KEYWORDS else "NAME", text, lineno))
             else:
-                if text == "(":
+                if text in "([{":
                     depth += 1
-                elif text == ")":
+                elif text in ")]}":
                     depth -= 1
                 toks.append(Tok("OP", text, lineno))
         if depth == 0:
             toks.append(Tok("NEWLINE", None, lineno))
     if depth != 0:
-        raise CompileError("unbalanced parentheses", len(src.split("\n")))
+        raise CompileError("unbalanced brackets", len(src.split("\n")))
     last = toks[-1].line if toks else 1
     while len(stack) > 1:
         stack.pop()
@@ -183,6 +186,16 @@ class Return(N): value: N
 @dataclass
 class ExprStmt(N): e: N
 @dataclass
+class ListLit(N): items: list
+@dataclass
+class MapLit(N): keys: list; vals: list
+@dataclass
+class Catch(N): cls: str; var: str; body: list
+@dataclass
+class Throw(N): value: N
+@dataclass
+class Try(N): body: list; catches: list; final: list = None   # catches: [Catch]
+@dataclass
 class Break(N): pass
 @dataclass
 class Continue(N): pass
@@ -234,11 +247,28 @@ class Parser:
             raise CompileError(f"expected {want!r}, found {got!r}", self.tok.line)
         return self.next()
 
+    def dotted_name(self):
+        """A class name, possibly qualified by a module alias: Circle or shapes.Circle."""
+        name = self.expect("NAME").val
+        while self.is_("OP", ".") and self.peek().kind == "NAME":
+            self.next()
+            name += "." + self.next().val
+        return name
+
     # program / classes
     def program(self):
-        classes = []
+        classes, self.imports = [], []         # imports: [(dotted module path, line)]
         while not self.is_("EOF"):
-            classes.append(self.class_decl())
+            if self.is_("KW", "bring"):
+                t = self.next()
+                path = [self.expect("NAME").val]
+                while self.accept("OP", "."):
+                    path.append(self.expect("NAME").val)
+                alias = self.expect("NAME").val if self.accept("KW", "as") else None
+                self.expect("NEWLINE")
+                self.imports.append((".".join(path), t.line, alias))
+            else:
+                classes.append(self.class_decl())
         return classes
 
     def class_decl(self):
@@ -256,9 +286,9 @@ class Parser:
             self.expect("OP", "]")
         supers = []
         if self.accept("OP", "<"):
-            supers.append(self.expect("NAME").val)
+            supers.append(self.dotted_name())
             while self.accept("OP", ","):
-                supers.append(self.expect("NAME").val)
+                supers.append(self.dotted_name())
         self.expect("OP", ":")
         self.expect("NEWLINE")
         self.expect("INDENT")
@@ -291,7 +321,7 @@ class Parser:
     def type_name(self):
         """A type, written canonically: weak X, List[int], Map[str,List[int]]."""
         weak = "weak " if self.accept("KW", "weak") else ""
-        name = self.expect("NAME").val
+        name = self.dotted_name()
         if self.accept("OP", "["):
             args = [self.type_name()]
             while self.accept("OP", ","):
@@ -351,6 +381,29 @@ class Parser:
                 v = None if self.is_("NEWLINE") else self.expr()
                 self.expect("NEWLINE")
                 return [Return(v, line=t.line)]
+            if kw == "throw":
+                self.next()
+                v = self.expr()
+                self.expect("NEWLINE")
+                return [Throw(v, line=t.line)]
+            if kw == "try":
+                self.next()
+                body = self.block()
+                catches = []
+                while self.is_("KW", "catch"):
+                    c = self.next()
+                    cls = var = None
+                    if self.is_("NAME"):
+                        cls = self.dotted_name()
+                        if self.accept("KW", "as"):
+                            var = self.expect("NAME").val
+                    catches.append(Catch(cls, var, self.block(), line=c.line))
+                final = None
+                if self.accept("KW", "finally"):
+                    final = self.block()
+                if not catches and final is None:
+                    raise CompileError("try needs at least one catch or a finally", t.line)
+                return [Try(body, catches, final, line=t.line)]
             if kw in ("break", "continue"):
                 self.next(); self.expect("NEWLINE")
                 return [(Break if kw == "break" else Continue)(line=t.line)]
@@ -449,7 +502,7 @@ class Parser:
                 l = Binary(t.val, l, self.add(), line=t.line)
             elif self.is_("KW", "instanceof"):
                 t = self.next()
-                l = InstanceOf(l, self.expect("NAME").val, line=t.line)
+                l = InstanceOf(l, self.dotted_name(), line=t.line)
             else:
                 return l
 
@@ -474,7 +527,7 @@ class Parser:
         e = self.postfix()
         while self.is_("KW", "as"):
             t = self.next()
-            e = Cast(e, self.expect("NAME").val, line=t.line)
+            e = Cast(e, self.dotted_name(), line=t.line)
         return e
 
     def postfix(self):
@@ -519,7 +572,7 @@ class Parser:
                 self.expect("OP", "(")
                 return SuperCall(name, self.args(), line=t.line)
             if t.val == "new":
-                cls = self.expect("NAME").val
+                cls = self.dotted_name()
                 if self.accept("OP", "["):
                     targs = [self.type_name()]
                     while self.accept("OP", ","):
@@ -532,6 +585,24 @@ class Parser:
             e = self.expr()
             self.expect("OP", ")")
             return e
+        if t.kind == "OP" and t.val == "[":
+            items = []
+            while not self.is_("OP", "]"):
+                items.append(self.expr())
+                if not self.accept("OP", ","):
+                    break
+            self.expect("OP", "]")
+            return ListLit(items, line=t.line)
+        if t.kind == "OP" and t.val == "{":
+            keys, vals = [], []
+            while not self.is_("OP", "}"):
+                keys.append(self.expr())
+                self.expect("OP", "->")
+                vals.append(self.expr())
+                if not self.accept("OP", ","):
+                    break
+            self.expect("OP", "}")
+            return MapLit(keys, vals, line=t.line)
         raise CompileError(f"unexpected {t.val if t.val is not None else t.kind!r}", t.line)
 
 
@@ -558,6 +629,7 @@ INTRINSICS = {
     "__mutex_free": (["int"], "void", "quill_mutex_free"),
     "__sleep_ms": (["int"], "void", "quill_sleep_ms"),
     "__panic": (["str"], "void", "quill_panic"),
+    "__exc_msg": ([], "str", "quill_exc_msg"),
 }
 
 # Built-in classes, written in Quill and compiled with every program.
@@ -591,6 +663,20 @@ class Mutex:
 
     def deinit(self):
         __mutex_free(self.handle)
+
+# Base class for exceptions. Runtime errors (bad index, null dereference, ...)
+# are thrown as plain Errors carrying the panic message.
+class Error:
+    message: str
+
+    def init(self, message: str):
+        self.message = message
+
+    def toString(self) -> str:
+        return "Error: " + self.message
+
+    static def fromPanic() -> Error:
+        return new Error(__exc_msg())
 
 # A growable array. Written as a template: List[int], List[str], List[Node]...
 class List[T]:
@@ -972,16 +1058,39 @@ missing:
   ret ptr null
 }
 
+; ---- exceptions: a per-thread "pending" flag ----
+; Throwing sets the flag and every function unwinds by itself: after each call the
+; generated code checks the flag, releases its locals and returns, until a try block
+; takes the exception. @quill_exc holds the thrown object (null for a runtime panic,
+; whose message is in @quill_exc_text).
+@quill_pending = thread_local global i32 0
+@quill_exc = thread_local global ptr null
+@quill_exc_text = thread_local global ptr null
+
+define ptr @quill_exc_msg() {
+  %m = load ptr, ptr @quill_exc_text
+  store ptr null, ptr @quill_exc_text
+  ret ptr %m
+}
+
 define void @quill_panic(ptr %msg) {
-  %r = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.fmt.panic, ptr %msg)
+  store ptr null, ptr @quill_exc
+  store ptr %msg, ptr @quill_exc_text
+  store i32 1, ptr @quill_pending
+  ret void
+}
+
+define void @quill_fatal() {
+  call void @quill_uncaught()
   call void @exit(i32 1)
   unreachable
 }
 
 define void @quill_panic_index(i64 %i, i64 %n) {
-  %r = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.fmt.index, i64 %i, i64 %n)
-  call void @exit(i32 1)
-  unreachable
+  %buf = call ptr @quill_alloc(i64 96)
+  %r = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 96, ptr @.fmt.index, i64 %i, i64 %n)
+  call void @quill_panic(ptr %buf)
+  ret void
 }
 
 ; FNV-1a hash of a C string
@@ -1068,7 +1177,9 @@ define void @quill_sleep_ms(i64 %ms) {
 '''
 
 RUNTIME += "\n" + cstr("@.fmt.panic", "error: %s\n") + "\n" + \
-    cstr("@.fmt.index", "error: index %ld out of range (length %ld)\n") + "\n"
+    cstr("@.fmt.index", "index %ld out of range (length %ld)") + "\n" + \
+    cstr("@.fmt.uncaught", "error: uncaught exception: %s\n") + "\n" + \
+    cstr("@.fmt.uncaught0", "error: uncaught exception\n") + "\n"
 
 
 def split_top(s):
@@ -1215,115 +1326,145 @@ class Module:
             d = work.pop()
             for t, line in iter_types(d):
                 self.ensure(t, line, work)
-        done = set()
-
-        def build(ci, stack=()):
-            if ci.name in done:
-                return
-            if ci.name in stack:
-                raise CompileError(f"cyclic inheritance involving {ci.name}", ci.decl.line)
-            d = ci.decl
-            sup = []
-            for n in d.supers:
-                if n not in self.classes:
-                    raise CompileError(f"unknown class or interface {n}", d.line)
-                sup.append(self.classes[n])
-                build(sup[-1], stack + (ci.name,))
-            parents = [c for c in sup if not c.is_interface]
-            ifaces = [c for c in sup if c.is_interface]
-            if d.interface and parents:
-                raise CompileError("an interface can only extend interfaces", d.line)
-            if len(parents) > 1:
-                raise CompileError(f"{ci.name} can extend only one class (the rest must be interfaces)", d.line)
-            ci.parent = parents[0] if parents else None
-            ci.interfaces = ifaces
-            ci.supers = {ci.name}.union(*[c.supers for c in sup]) if sup else {ci.name}
-            if ci.parent:
-                ci.fields = list(ci.parent.fields)
-                ci.field_info = dict(ci.parent.field_info)
-                ci.vtable = list(ci.parent.vtable)
-                ci.required = dict(ci.parent.required)
-            for i in ifaces:
-                for n, im in i.required.items():
-                    old = ci.required.get(n)
-                    if old and (old.params != im.params or old.ret != im.ret):
-                        raise CompileError(f"conflicting signatures for interface method {n}", d.line)
-                    ci.required[n] = im
-            if d.interface and d.fields:
-                raise CompileError("interfaces cannot have fields", d.line)
-            for f in d.fields:
-                self.check_type(f.type, f.line)
-                if any(f.name == n for n, _ in ci.fields):
-                    raise CompileError(f"duplicate field {f.name}", f.line)
-                ci.fields.append((f.name, f.type))
-                ci.field_info[f.name] = (ci.name, f.access)
-            for m in d.methods:
-                if m.name in ci.methods:
-                    raise CompileError(f"duplicate method {m.name}", m.line)
-                for _, t in m.params:
-                    self.check_type(t, m.line)
-                    if self.is_weak(t):
-                        raise CompileError("parameters cannot be weak", m.line)
-                self.check_type(m.ret, m.line)
-                if self.is_weak(m.ret):
-                    raise CompileError("return types cannot be weak", m.line)
-                if m.name == "deinit" and (m.static or m.params or m.ret != "void"):
-                    raise CompileError("deinit must be an instance method with no parameters and no result", m.line)
-                if m.abstract and not d.abstract and not d.interface:
-                    raise CompileError(f"abstract method {m.name} in non-abstract class {ci.name}", m.line)
-                if m.abstract and (m.static or m.access == "private"):
-                    raise CompileError("abstract methods cannot be static or private", m.line)
-                if d.interface and (m.name in ("init", "deinit") or m.access == "private"):
-                    raise CompileError("interfaces can only declare public instance methods", m.line)
-                mi = MethodInfo(m.name, ci.name, m.params, m.ret, m.static, m,
-                                m.access, m.abstract, d.interface)
-                ci.methods[m.name] = mi
-                if d.interface:
-                    old = self.iface_sigs.setdefault(m.name, (m.params, m.ret))
-                    if old != (m.params, m.ret):
-                        raise CompileError(f"interface method name {m.name} is declared with different signatures", m.line)
-                    self.iface_ids.setdefault(m.name, len(self.iface_ids))
-                    ci.required[m.name] = mi
-                    continue
-                if m.static or m.name in ("init", "deinit"):
-                    continue
-                prev = self.find_class_method(ci.parent, m.name) if ci.parent else None
-                if prev and prev.access == "private":
-                    prev = None            # private methods are not inherited or overridden
-                if m.access == "private":
-                    if prev:
-                        raise CompileError(f"{ci.name}.{m.name} cannot reduce the visibility of the method it overrides", m.line)
-                    continue               # private methods are non-virtual
-                if prev:
-                    if prev.static or prev.params != m.params or prev.ret != m.ret:
-                        raise CompileError(f"{ci.name}.{m.name} has a different signature than the method it overrides", m.line)
-                elif m.name not in ci.vtable:
-                    ci.vtable.append(m.name)
-            done.add(ci.name)
-
+        self.built = set()
         for ci in self.classes.values():
-            build(ci)
+            self.build_class(ci)
 
         # every concrete class must implement all abstract and interface methods
         for ci in self.classes.values():
-            if ci.is_interface:
-                continue
-            line = ci.decl.line
-            if not ci.is_abstract:
-                for name in ci.vtable:
-                    impl = self.find_class_method(ci, name)
-                    if impl.abstract:
-                        raise CompileError(f"class {ci.name} must implement abstract method {impl.owner}.{name}", line)
-            for name, im in ci.required.items():
+            try:
+                self.check_complete(ci)
+            except CompileError as e:
+                if e.file is None:
+                    e.file = getattr(ci.decl, "file", None)
+                raise
+
+    def check_complete(self, ci):
+        if ci.is_interface:
+            return
+        line = ci.decl.line
+        if not ci.is_abstract:
+            for name in ci.vtable:
                 impl = self.find_class_method(ci, name)
-                if impl is None or impl.abstract or impl.static:
-                    if ci.is_abstract:
-                        continue
-                    raise CompileError(f"class {ci.name} does not implement {im.owner}.{name}", line)
-                if impl.access == "private":
-                    raise CompileError(f"{impl.owner}.{name} implements an interface method, so it cannot be private", impl.decl.line)
-                if impl.params != im.params or impl.ret != im.ret:
-                    raise CompileError(f"{impl.owner}.{name} has a different signature than interface method {im.owner}.{name}", impl.decl.line)
+                if impl.abstract:
+                    raise CompileError(f"class {ci.name} must implement abstract method {impl.owner}.{name}", line)
+        for name, im in ci.required.items():
+            impl = self.find_class_method(ci, name)
+            if impl is None or impl.abstract or impl.static:
+                if ci.is_abstract:
+                    continue
+                raise CompileError(f"class {ci.name} does not implement {im.owner}.{name}", line)
+            if impl.access == "private":
+                raise CompileError(f"{impl.owner}.{name} implements an interface method, so it cannot be private", impl.decl.line)
+            if impl.params != im.params or impl.ret != im.ret:
+                raise CompileError(f"{impl.owner}.{name} has a different signature than interface method {im.owner}.{name}", impl.decl.line)
+
+    def build_class(self, ci, stack=()):
+        try:
+            self.build_class_body(ci, stack)
+        except CompileError as e:
+            if e.file is None:
+                e.file = getattr(ci.decl, "file", None)
+            raise
+
+    def build_class_body(self, ci, stack=()):
+        if ci.name in self.built:
+            return
+        if ci.name in stack:
+            raise CompileError(f"cyclic inheritance involving {ci.name}", ci.decl.line)
+        d = ci.decl
+        sup = []
+        for n in d.supers:
+            if n not in self.classes:
+                raise CompileError(f"unknown class or interface {n}", d.line)
+            sup.append(self.classes[n])
+            self.build_class(sup[-1], stack + (ci.name,))
+        parents = [c for c in sup if not c.is_interface]
+        ifaces = [c for c in sup if c.is_interface]
+        if d.interface and parents:
+            raise CompileError("an interface can only extend interfaces", d.line)
+        if len(parents) > 1:
+            raise CompileError(f"{ci.name} can extend only one class (the rest must be interfaces)", d.line)
+        ci.parent = parents[0] if parents else None
+        ci.interfaces = ifaces
+        ci.supers = {ci.name}.union(*[c.supers for c in sup]) if sup else {ci.name}
+        if ci.parent:
+            ci.fields = list(ci.parent.fields)
+            ci.field_info = dict(ci.parent.field_info)
+            ci.vtable = list(ci.parent.vtable)
+            ci.required = dict(ci.parent.required)
+        for i in ifaces:
+            for n, im in i.required.items():
+                old = ci.required.get(n)
+                if old and (old.params != im.params or old.ret != im.ret):
+                    raise CompileError(f"conflicting signatures for interface method {n}", d.line)
+                ci.required[n] = im
+        if d.interface and d.fields:
+            raise CompileError("interfaces cannot have fields", d.line)
+        for f in d.fields:
+            self.check_type(f.type, f.line)
+            if any(f.name == n for n, _ in ci.fields):
+                raise CompileError(f"duplicate field {f.name}", f.line)
+            ci.fields.append((f.name, f.type))
+            ci.field_info[f.name] = (ci.name, f.access)
+        for m in d.methods:
+            if m.name in ci.methods:
+                raise CompileError(f"duplicate method {m.name}", m.line)
+            for _, t in m.params:
+                self.check_type(t, m.line)
+                if self.is_weak(t):
+                    raise CompileError("parameters cannot be weak", m.line)
+            self.check_type(m.ret, m.line)
+            if self.is_weak(m.ret):
+                raise CompileError("return types cannot be weak", m.line)
+            if m.name == "deinit" and (m.static or m.params or m.ret != "void"):
+                raise CompileError("deinit must be an instance method with no parameters and no result", m.line)
+            if m.abstract and not d.abstract and not d.interface:
+                raise CompileError(f"abstract method {m.name} in non-abstract class {ci.name}", m.line)
+            if m.abstract and (m.static or m.access == "private"):
+                raise CompileError("abstract methods cannot be static or private", m.line)
+            if d.interface and (m.name in ("init", "deinit") or m.access == "private"):
+                raise CompileError("interfaces can only declare public instance methods", m.line)
+            mi = MethodInfo(m.name, ci.name, m.params, m.ret, m.static, m,
+                            m.access, m.abstract, d.interface)
+            ci.methods[m.name] = mi
+            if d.interface:
+                old = self.iface_sigs.setdefault(m.name, (m.params, m.ret))
+                if old != (m.params, m.ret):
+                    raise CompileError(f"interface method name {m.name} is declared with different signatures", m.line)
+                self.iface_ids.setdefault(m.name, len(self.iface_ids))
+                ci.required[m.name] = mi
+                continue
+            if m.static or m.name in ("init", "deinit"):
+                continue
+            prev = self.find_class_method(ci.parent, m.name) if ci.parent else None
+            if prev and prev.access == "private":
+                prev = None            # private methods are not inherited or overridden
+            if m.access == "private":
+                if prev:
+                    raise CompileError(f"{ci.name}.{m.name} cannot reduce the visibility of the method it overrides", m.line)
+                continue               # private methods are non-virtual
+            if prev:
+                if prev.static or prev.params != m.params or prev.ret != m.ret:
+                    raise CompileError(f"{ci.name}.{m.name} has a different signature than the method it overrides", m.line)
+            elif m.name not in ci.vtable:
+                ci.vtable.append(m.name)
+        self.built.add(ci.name)
+
+    def instantiate(self, t, line):
+        """Create a generic instance such as List[int] while code is being generated
+        (literals only learn their element types then)."""
+        if t in self.classes:
+            return
+        before = set(self.classes)
+        work = []
+        self.ensure(t, line, work)
+        while work:
+            d = work.pop()
+            for tt, ln in iter_types(d):
+                self.ensure(tt, ln, work)
+        for name in [n for n in self.classes if n not in before]:
+            self.build_class(self.classes[name])
 
     def ensure(self, t, line, work):
         """Instantiate a generic type like List[int] (and its arguments) if needed."""
@@ -1394,6 +1535,39 @@ class Module:
     def is_ref(self, t):
         return t == "str" or t in self.classes
 
+    def uncaught_fn(self, concrete):
+        """Reports an exception nobody caught: a panic message, an Error's message,
+        or just the fact that something was thrown."""
+        errs = [ci for ci in concrete if ci.elem is None and self.is_subclass(ci.name, "Error")]
+        L = ["define void @quill_uncaught() {",
+             "  %e = load ptr, ptr @quill_exc",
+             "  %isn = icmp eq ptr %e, null",
+             "  br i1 %isn, label %panic, label %obj",
+             "panic:",
+             "  %pm = load ptr, ptr @quill_exc_text",
+             "  %r0 = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.fmt.panic, ptr %pm)",
+             "  ret void",
+             "obj:",
+             "  %vt = load ptr, ptr %e"]
+        acc = "false"
+        for i, ci in enumerate(errs):
+            L.append(f'  %h{i} = icmp eq ptr %vt, @"vtable.{ci.name}"')
+            L.append(f"  %a{i} = or i1 {acc}, %h{i}")
+            acc = f"%a{i}"
+        L += [f"  br i1 {acc}, label %err, label %other",
+              "err:",
+              '  %mp = getelementptr %"Error", ptr %e, i32 0, i32 1',
+              "  %m = load ptr, ptr %mp",
+              "  %mn = icmp eq ptr %m, null",
+              f"  %ms = select i1 %mn, ptr {self.string('(no message)')}, ptr %m",
+              "  %r1 = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.fmt.uncaught, ptr %ms)",
+              "  ret void",
+              "other:",
+              "  %r2 = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.fmt.uncaught0)",
+              "  ret void",
+              "}"]
+        return "\n".join(L)
+
     def drop_fn(self, ci):
         if ci.elem is not None:
             return self.array_drop_fn(ci)
@@ -1454,10 +1628,16 @@ done:
             raise CompileError("Main.main must return void or int", mm.decl.line)
 
         funcs = []
-        for ci in self.classes.values():
-            for mi in ci.methods.values():
-                if not mi.abstract:
-                    funcs.append(FuncGen(self, ci, mi).generate())
+        seen = set()
+        while True:
+            todo = [ci for ci in list(self.classes.values()) if ci.name not in seen]
+            if not todo:
+                break
+            for ci in todo:
+                seen.add(ci.name)
+                for mi in ci.methods.values():
+                    if not mi.abstract:
+                        funcs.append(FuncGen(self, ci, mi).generate())
 
         out = [RUNTIME]
         objects = [ci for ci in self.classes.values() if not ci.is_interface]
@@ -1476,6 +1656,7 @@ done:
                 slots.append(f"ptr {self.find_class_method(ci, name).symbol}")
             out.append(f'@"vtable.{ci.name}" = constant [{len(slots)} x ptr] [{", ".join(slots)}]')
         out.extend(funcs)
+        out.append(self.uncaught_fn(concrete))
         for ci in concrete:
             out.append(self.drop_fn(ci))
         slot = self.classes["Thread"].vtable.index("run") + 2   # slots 0, 1 = drop, itable
@@ -1484,12 +1665,21 @@ done:
   %sp = getelementptr ptr, ptr %vt, i64 {slot}
   %fn = load ptr, ptr %sp
   call void %fn(ptr %obj)
+  %pend = load i32, ptr @quill_pending
+  %thrown = icmp ne i32 %pend, 0
+  br i1 %thrown, label %fatal, label %ok
+fatal:
+  call void @quill_fatal()
+  unreachable
+ok:
   call void @quill_release_obj(ptr %obj)
   ret ptr null
 }}""")
         ret = "i32"
-        call = f'  %r = call i64 {mm.symbol}()\n  %c = trunc i64 %r to i32\n  ret i32 %c' if mm.ret == "int" \
-            else f'  call void {mm.symbol}()\n  ret i32 0'
+        check = ("  %pend = load i32, ptr @quill_pending\n  %thrown = icmp ne i32 %pend, 0\n"
+                 "  br i1 %thrown, label %fatal, label %ok\nfatal:\n  call void @quill_fatal()\n  unreachable\nok:\n")
+        call = f'  %r = call i64 {mm.symbol}()\n{check}  %c = trunc i64 %r to i32\n  ret i32 %c' if mm.ret == "int" \
+            else f'  call void {mm.symbol}()\n{check}  ret i32 0'
         out.append(f"define i32 @main() {{\n{call}\n}}")
         # string constants last (names are assigned while generating)
         consts = []
@@ -1500,6 +1690,15 @@ done:
         return "\n".join(consts + out) + "\n"
 
 
+@dataclass
+class Region:
+    """A try block being compiled: where its exceptions go, its finally block, and
+    the scope depth at which the block began."""
+    handler: str
+    final: list
+    depth: int
+
+
 class FuncGen:
     def __init__(self, mod, ci, mi):
         self.mod, self.ci, self.mi = mod, ci, mi
@@ -1508,7 +1707,10 @@ class FuncGen:
         self.scopes = [{}]
         self.terminated = False
         self.loops = []
-        self.fresh = set()   # temps that hold an owned (+1) reference
+        self.tries = []          # the try blocks being compiled, innermost last
+        self.cleanup = []        # unwind blocks, appended after the function body
+        self.unwind_cache = {}
+        self.fresh = {}      # temps that hold an owned (+1) reference -> "str" or "obj"
 
     # ---- low-level helpers ----
     def tmp(self):
@@ -1549,7 +1751,7 @@ class FuncGen:
         return t
 
     def err(self, msg, node):
-        raise CompileError(msg, node.line)
+        raise CompileError(msg, node.line, getattr(self.ci.decl, "file", None))
 
     # ---- reference counting ----
     # Ownership model: locals/params own one reference. Expression results are
@@ -1568,28 +1770,98 @@ class FuncGen:
     def consume(self, v, t):
         """Take ownership of an expression result (retain if it was borrowed)."""
         if self.is_ref(t) and v in self.fresh:
-            self.fresh.discard(v)
+            self.fresh.pop(v, None)
         elif self.is_ref(t) and v != "null" and not v.startswith("getelementptr"):
             self.retain(v)
         return v
 
     def release_fresh(self, v, t):
         if v in self.fresh and self.is_ref(t):
-            self.fresh.discard(v)
+            self.fresh.pop(v, None)
             self.release(v, t)
 
     def upgrade(self, v, ty):
         """Read a weak slot: yields a fresh strong reference, or null if dead."""
         r = self.op(f"call ptr @quill_weak_upgrade(ptr {v})")
-        self.fresh.add(r)
+        self.fresh[r] = "obj"
         return r, ty[5:]
 
     def release_scope(self, sc):
         for ptr, ty in reversed(list(sc.values())):
-            if self.mod.is_weak(ty):
-                self.emit(f"call void @quill_weak_release(ptr {self.op(f'load ptr, ptr {ptr}')})")
-            elif self.is_ref(ty):
-                self.release(self.op(f"load ptr, ptr {ptr}"), ty)
+            self.release_var(ptr, ty, self.emit, self.op)
+
+    def release_var(self, ptr, ty, emit, op):
+        if self.mod.is_weak(ty):
+            emit(f"call void @quill_weak_release(ptr {op(f'load ptr, ptr {ptr}')})")
+        elif self.is_ref(ty):
+            fn = "quill_release_str" if ty == "str" else "quill_release_obj"
+            emit(f"call void @{fn}(ptr {op(f'load ptr, ptr {ptr}')})")
+
+    # ---- unwinding: how an exception leaves this function ----
+    def unwind_label(self):
+        """A label to branch to while an exception is pending: it releases the locals
+        declared since the innermost try began (or all of them), then continues at that
+        try's handler, or returns from the function."""
+        if self.tries:
+            target, floor = self.tries[-1].handler, self.tries[-1].depth
+        else:
+            target, floor = self.exit_label(), 0
+        label = target
+        for sc in self.scopes[floor:]:
+            for ptr, ty in sc.values():
+                if not (self.mod.is_weak(ty) or self.is_ref(ty)):
+                    continue
+                key = (ptr, label)
+                if key not in self.unwind_cache:
+                    name = self.label("unw")
+                    lines = []
+                    n = [0]
+
+                    def op(text, lines=lines, n=n, name=name):
+                        n[0] += 1
+                        t = f"%{name}.{n[0]}"
+                        lines.append(f"  {t} = {text}")
+                        return t
+
+                    self.release_var(ptr, ty, lambda text, lines=lines: lines.append("  " + text), op)
+                    self.cleanup.append(f"{name}:\n" + "\n".join(lines) + f"\n  br label %{label}")
+                    self.unwind_cache[key] = name
+                label = self.unwind_cache[key]
+        return label
+
+    def exit_label(self):
+        if "exit" not in self.unwind_cache:
+            ret = self.mod.llty(self.mi.ret)
+            zero = {"void": None, "i64": "0", "double": "0.0", "i1": "false", "ptr": "null"}[ret]
+            name = self.label("unw.exit")
+            self.cleanup.append(f"{name}:\n  " + ("ret void" if ret == "void" else f"ret {ret} {zero}"))
+            self.unwind_cache["exit"] = name
+        return self.unwind_cache["exit"]
+
+    def check_pending(self):
+        """After a call: if it threw, unwind."""
+        flag = self.op("icmp ne i32 " + self.op("load i32, ptr @quill_pending") + ", 0")
+        ok = self.label("ok")
+        if self.fresh:
+            site = self.label("unw.site")
+            self.condbr(flag, site, ok)
+            self.place(site)
+            self.leave_by_exception()
+        else:
+            self.condbr(flag, self.unwind_label(), ok)
+        self.place(ok)
+
+    def leave_by_exception(self):
+        """Release the temporaries still owned by the expression being evaluated,
+        then take the unwind path."""
+        for v, kind in list(self.fresh.items()):
+            self.release(v, kind)
+        self.br(self.unwind_label())
+
+    def raise_pending(self):
+        """The exception is set up; leave through the unwind path."""
+        self.emit("store i32 1, ptr @quill_pending")
+        self.leave_by_exception()
 
     def release_from(self, depth):
         if not self.terminated:
@@ -1642,7 +1914,7 @@ class FuncGen:
             zero = {"void": None, "i64": "0", "double": "0.0", "i1": "false", "ptr": "null"}[ret]
             self.emit("ret void" if ret == "void" else f"ret {ret} {zero}")
         return (f'define {ret} {mi.symbol}({sig}) {{\nentry:\n'
-                + "\n".join(self.allocas + self.lines) + "\n}")
+                + "\n".join(self.allocas + self.lines + self.cleanup) + "\n}")
 
     # ---- statements ----
     def block(self, stmts):
@@ -1669,7 +1941,7 @@ class FuncGen:
             return
         val = None
         if s.init is not None:
-            v, t = self.expr(s.init)
+            v, t = self.expr_want(s.init, s.type)
             val = self.coerce(self.consume(v, t), t, s.type, s, "initializer")
         ptr = self.declare(s.name, s.type, s)
         lt = self.mod.llty(s.type)
@@ -1687,7 +1959,7 @@ class FuncGen:
             ptr = self.declare(s.target.id, t, s)
             self.emit(f"store {self.mod.llty(t)} {v}, ptr {ptr}")
             return
-        v, t = self.expr(s.value)               # value first, then the target
+        v, t = self.expr_want(s.value, self.peek_type(s.target))   # value first, then the target
         self.consume(v, t)
         ptr, ty, ov, ot = self.lvalue(s.target)
         if self.mod.is_weak(ty):
@@ -1727,15 +1999,17 @@ class FuncGen:
         if s.value is None:
             if want != "void":
                 self.err(f"must return a {want}", s)
-            self.release_from(0)
-            self.emit("ret void")
+            self.leave(0, 0)
+            if not self.terminated:
+                self.emit("ret void")
         else:
             if want == "void":
                 self.err("void method cannot return a value", s)
-            v, t = self.expr(s.value)
+            v, t = self.expr_want(s.value, want)
             v = self.coerce(self.consume(v, t), t, want, s, "return value")
-            self.release_from(0)
-            self.emit(f"ret {self.mod.llty(want)} {v}")
+            self.leave(0, 0)
+            if not self.terminated:
+                self.emit(f"ret {self.mod.llty(want)} {v}")
         self.terminated = True
 
     def s_If(self, s):
@@ -1753,7 +2027,7 @@ class FuncGen:
         self.br(c_l); self.place(c_l)
         self.condbr(self.cond(s.cond), b_l, e_l)
         self.place(b_l)
-        self.loops.append((c_l, e_l, len(self.scopes))); self.block(s.body); self.loops.pop()
+        self.loops.append((c_l, e_l, len(self.scopes), len(self.tries))); self.block(s.body); self.loops.pop()
         self.br(c_l); self.place(e_l)
 
     def s_ForRange(self, s):
@@ -1769,7 +2043,7 @@ class FuncGen:
         cur = self.op(f"load i64, ptr {ptr}")
         self.condbr(self.op(f"icmp slt i64 {cur}, {ev}"), b_l, e_l)
         self.place(b_l)
-        self.loops.append((i_l, e_l, len(self.scopes))); self.block(s.body); self.loops.pop()
+        self.loops.append((i_l, e_l, len(self.scopes), len(self.tries))); self.block(s.body); self.loops.pop()
         self.br(i_l); self.place(i_l)
         cur = self.op(f"load i64, ptr {ptr}")
         nxt = self.op(f"add i64 {cur}, 1")
@@ -1777,19 +2051,198 @@ class FuncGen:
         self.br(c_l); self.place(e_l)
         self.scopes.pop()
 
+    def release_range(self, lo, hi, scopes):
+        for sc in reversed(scopes[lo:hi]):
+            self.release_scope(sc)
+
+    def leave(self, try_depth, scope_depth):
+        """Control leaves early (return, break, continue): release the scopes it
+        skips and run the finally blocks of the try statements above `try_depth`,
+        innermost first. A finally block may itself end the flow (return, throw)."""
+        if self.terminated:
+            return
+        scopes, tries = self.scopes, self.tries
+        hi = len(scopes)
+        for k in range(len(tries) - 1, try_depth - 1, -1):
+            region = tries[k]
+            self.release_range(region.depth, hi, scopes)
+            hi = region.depth
+            if region.final is not None:
+                self.scopes, self.tries = scopes[:region.depth], tries[:k]
+                self.block(region.final)
+                self.scopes, self.tries = scopes, tries
+                if self.terminated:
+                    return
+        self.release_range(scope_depth, hi, scopes)
+
+    def s_Throw(self, s):
+        v, t = self.expr(s.value)
+        if not self.mod.is_class(t):
+            self.err(f"can only throw objects, got {t}", s)
+        self.null_check(v, "cannot throw null")
+        self.consume(v, t)                       # the exception slot owns the reference
+        self.emit(f"store ptr {v}, ptr @quill_exc")
+        self.raise_pending()
+
+    def s_Try(self, s):
+        if s.final is None:
+            return self.try_catch(s.body, s.catches, s)
+        # try/finally: whatever escapes is parked, the finally block runs, and the
+        # exception continues; normal exits and return/break/continue run the same
+        # block inline (see leave)
+        handler, end = self.label("fin.catch"), self.label("fin.end")
+        self.tries.append(Region(handler, s.final, len(self.scopes)))
+        if s.catches:
+            self.try_catch(s.body, s.catches, s)
+        else:
+            self.block(s.body)
+        self.tries.pop()
+        if not self.terminated:
+            self.block(s.final)
+        self.br(end)
+        self.place(handler)
+        exc, txt = self.alloca("ptr", "fin.exc"), self.alloca("ptr", "fin.txt")
+        self.emit(f"store ptr {self.op('load ptr, ptr @quill_exc')}, ptr {exc}")
+        self.emit(f"store ptr {self.op('load ptr, ptr @quill_exc_text')}, ptr {txt}")
+        self.emit("store i32 0, ptr @quill_pending")
+        self.block(s.final)
+        if not self.terminated:
+            self.emit(f"store ptr {self.op(f'load ptr, ptr {exc}')}, ptr @quill_exc")
+            self.emit(f"store ptr {self.op(f'load ptr, ptr {txt}')}, ptr @quill_exc_text")
+            self.raise_pending()
+        self.place(end)
+
+    def try_catch(self, body_stmts, catches, s):
+        handler, end = self.label("try.catch"), self.label("try.end")
+        self.tries.append(Region(handler, None, len(self.scopes)))
+        self.block(body_stmts)
+        self.tries.pop()
+        self.br(end)
+
+        # an exception is pending: take it
+        self.place(handler)
+        slot = self.alloca("ptr", "exc")
+        self.emit(f"store ptr {self.op('load ptr, ptr @quill_exc')}, ptr {slot}")
+        self.emit("store ptr null, ptr @quill_exc")
+        self.emit("store i32 0, ptr @quill_pending")
+        panic, have = self.label("exc.panic"), self.label("exc.have")
+        self.condbr(self.op(f"icmp eq ptr {self.op(f'load ptr, ptr {slot}')}, null"), panic, have)
+        self.place(panic)                        # a runtime panic: wrap its message in an Error
+        pv, pt = self.expr(Call(FieldAccess(Name("Error", line=s.line), "fromPanic", line=s.line), [], line=s.line))
+        self.consume(pv, pt)
+        self.emit(f"store ptr {pv}, ptr {slot}")
+        self.br(have)
+        self.place(have)
+        for cat in catches:
+            cls, var, cbody, cline = cat.cls, cat.var, cat.body, cat.line
+            nxt, hit = self.label("catch.next"), self.label("catch.hit")
+            exc = self.op(f"load ptr, ptr {slot}")
+            if cls is not None:
+                self.condbr(self.type_test(exc, cls, Name(cls, line=cline)), hit, nxt)
+            else:
+                self.br(hit)
+            self.place(hit)
+            self.scopes.append({})
+            if var is not None:
+                ptr = self.declare(var, cls, Name(var, line=cline))
+                self.emit(f"store ptr {exc}, ptr {ptr}")        # the variable now owns it
+            else:
+                self.release(exc, "obj")
+            self.block(cbody)
+            self.release_from(len(self.scopes) - 1)
+            self.scopes.pop()
+            self.br(end)
+            self.place(nxt)
+        # nothing matched: pass it on to the enclosing handler
+        self.emit(f"store ptr {self.op(f'load ptr, ptr {slot}')}, ptr @quill_exc")
+        self.raise_pending()
+        self.place(end)
+
     def s_Break(self, s):
         if not self.loops: self.err("break outside loop", s)
-        self.release_from(self.loops[-1][2])
+        self.leave(self.loops[-1][3], self.loops[-1][2])
         self.br(self.loops[-1][1])
 
     def s_Continue(self, s):
         if not self.loops: self.err("continue outside loop", s)
-        self.release_from(self.loops[-1][2])
+        self.leave(self.loops[-1][3], self.loops[-1][2])
         self.br(self.loops[-1][0])
 
     # ---- expressions: each returns (llvm operand, quill type) ----
     def expr(self, e):
         return getattr(self, "e_" + type(e).__name__)(e)
+
+    def expr_want(self, e, want):
+        """Evaluate e; a list or map literal takes its element types from `want`."""
+        if want is not None and isinstance(e, (ListLit, MapLit)):
+            return getattr(self, "e_" + type(e).__name__)(e, want)
+        return self.expr(e)
+
+    def peek_type(self, target):
+        """The declared type of an assignment target, when it is cheap to know."""
+        if isinstance(target, Name):
+            var = self.lookup(target.id)
+            return var[1] if var else None
+        if isinstance(target, FieldAccess) and isinstance(target.obj, SelfExpr):
+            return dict(self.ci.fields).get(target.name)
+        return None
+
+    def common_type(self, types, node, what):
+        ts = [t for t in types if t != "null"]
+        if not ts:
+            return None
+        if any(t == "void" for t in ts):
+            self.err(f"a {what} cannot hold a void value", node)
+        if all(t == ts[0] for t in ts):
+            return ts[0]
+        if all(t in NUM for t in ts):
+            return "float"
+        for cand in ts:
+            if all(self.assignable(t, cand) for t in ts):
+                return cand
+        self.err(f"the {what}'s elements have no common type; declare the type you want", node)
+
+    def e_ListLit(self, e, want=None):
+        et = None
+        if want and parse_type(want)[0] == "List":
+            et = parse_type(want)[1][0]
+        vals = [self.expr_want(x, et) for x in e.items]
+        if et is None:
+            et = self.common_type([t for _, t in vals], e, "list")
+            if et is None:
+                self.err("cannot tell what this list holds; declare the variable's type", e)
+        name = f"List[{et}]"
+        self.mod.instantiate(name, e.line)
+        lst, _ = self.e_New(New(name, [], line=e.line))
+        add = self.mod.find_method(self.mod.classes[name], "add")
+        for (v, t), x in zip(vals, e.items):
+            cv = self.coerce(v, t, et, x, "list element")
+            self.emit(f"call void {add.symbol}(ptr {lst}, {self.mod.llty(et)} {cv})")
+            self.release_fresh(v, t)
+        return lst, name
+
+    def e_MapLit(self, e, want=None):
+        kt = vt = None
+        if want and parse_type(want)[0] == "Map":
+            kt, vt = parse_type(want)[1]
+        ks = [self.expr_want(x, kt) for x in e.keys]
+        vs = [self.expr_want(x, vt) for x in e.vals]
+        if kt is None:
+            kt = self.common_type([t for _, t in ks], e, "map")
+            vt = self.common_type([t for _, t in vs], e, "map")
+            if kt is None or vt is None:
+                self.err("cannot tell what this map holds; declare the variable's type", e)
+        name = f"Map[{kt},{vt}]"
+        self.mod.instantiate(name, e.line)
+        mp, _ = self.e_New(New(name, [], line=e.line))
+        put = self.mod.find_method(self.mod.classes[name], "put")
+        for (k, ktype), (v, vtype), kx, vx in zip(ks, vs, e.keys, e.vals):
+            ck = self.coerce(k, ktype, kt, kx, "map key")
+            cv = self.coerce(v, vtype, vt, vx, "map value")
+            self.emit(f"call void {put.symbol}(ptr {mp}, {self.mod.llty(kt)} {ck}, {self.mod.llty(vt)} {cv})")
+            self.release_fresh(k, ktype)
+            self.release_fresh(v, vtype)
+        return mp, name
 
     def cond(self, e):
         v, t = self.expr(e)
@@ -1839,7 +2292,7 @@ class FuncGen:
             self.null_check(rv, "null string (concatenation)")
             r = self.op(f"call ptr @quill_concat(ptr {lv}, ptr {rv})")
             self.release_fresh(lv, lt); self.release_fresh(rv, rt)
-            self.fresh.add(r)
+            self.fresh[r] = "str"
             return r, "str"
         if lt not in NUM or rt not in NUM:
             self.err(f"operator {e.op} not supported for {lt} and {rt}", e)
@@ -1966,7 +2419,7 @@ class FuncGen:
             val, ty = self.upgrade(val, ty)
         elif ov in self.fresh and self.is_ref(ty):   # field of a temporary object:
             self.retain(val)                         # keep it alive past the temp
-            self.fresh.add(val)
+            self.fresh[val] = "str" if ty == "str" else "obj"
         self.release_fresh(ov, ot)
         return val, ty
 
@@ -1982,7 +2435,7 @@ class FuncGen:
         size_p = self.op(f'getelementptr %"{ci.name}", ptr null, i32 1')
         size = self.op(f"ptrtoint ptr {size_p} to i64")
         obj = self.op(f"call ptr @quill_alloc(i64 {size})")
-        self.fresh.add(obj)
+        self.fresh[obj] = "obj"
         self.emit(f'store ptr @"vtable.{ci.name}", ptr {obj}')
         init = self.mod.find_class_method(ci, "init")
         if init:
@@ -1999,7 +2452,7 @@ class FuncGen:
         vals = [] if self_val is None else [f"ptr {self_val}"]
         temps = []
         for a, (pn, pt) in zip(args, mi.params):
-            v, t = self.expr(a)
+            v, t = self.expr_want(a, pt)
             vals.append(f"{self.mod.llty(pt)} {self.coerce(v, t, pt, a, 'argument ' + pn)}")
             temps.append((v, pt))
         rt = self.mod.llty(mi.ret)
@@ -2015,15 +2468,30 @@ class FuncGen:
         call = f"call {rt} {target}({', '.join(vals)})"
         if rt == "void":
             self.emit(call)
+            self.check_pending()
             res = (None, "void")
         else:
             r = self.op(call)
+            self.check_pending()
             if self.is_ref(mi.ret):
-                self.fresh.add(r)             # callee returns an owned reference
+                self.fresh[r] = "str" if mi.ret == "str" else "obj"   # callee returns an owned reference
             res = (r, mi.ret)
         for v, t in temps:
             self.release_fresh(v, t)
         return res
+
+    def class_ref(self, e):
+        """The class that a name like Circle or shapes.Circle refers to, unless its
+        first word is a variable."""
+        parts = []
+        while isinstance(e, FieldAccess):
+            parts.append(e.name)
+            e = e.obj
+        if not isinstance(e, Name) or self.lookup(e.id):
+            return None
+        parts.append(e.id)
+        name = ".".join(reversed(parts))
+        return name if name in self.mod.classes else None
 
     def e_Call(self, e):
         c = e.callee
@@ -2032,8 +2500,9 @@ class FuncGen:
         if not isinstance(c, FieldAccess):
             self.err("only methods and builtins can be called", e)
         # static call: ClassName.method(...)
-        if isinstance(c.obj, Name) and not self.lookup(c.obj.id) and c.obj.id in self.mod.classes:
-            ci = self.mod.classes[c.obj.id]
+        cname = self.class_ref(c.obj)
+        if cname:
+            ci = self.mod.classes[cname]
             mi = self.mod.find_class_method(ci, c.name)
             if not mi or not mi.static:
                 self.err(f"{ci.name} has no static method {c.name}", e)
@@ -2066,15 +2535,13 @@ class FuncGen:
         self.condbr(cond, good, bad)
         self.place(bad)
         self.emit(f"call void @quill_panic(ptr {self.mod.string(msg)})")
-        self.emit("unreachable")
-        self.terminated = True
+        self.raise_pending()
         self.place(good)
 
     def null_check(self, v, msg):
         if v == "null":
             self.emit(f"call void @quill_panic(ptr {self.mod.string(msg)})")
-            self.emit("unreachable")
-            self.terminated = True
+            self.raise_pending()
             self.place(self.label("after.null"))
             return
         self.panic_unless(self.op(f"icmp ne ptr {v}, null"), msg)
@@ -2085,8 +2552,7 @@ class FuncGen:
         self.condbr(self.op(f"icmp ult i64 {idx}, {n}"), good, bad)   # unsigned: also rejects negatives
         self.place(bad)
         self.emit(f"call void @quill_panic_index(i64 {idx}, i64 {n})")
-        self.emit("unreachable")
-        self.terminated = True
+        self.raise_pending()
         self.place(good)
 
     def elem_ptr(self, arr, idx, et):
@@ -2103,7 +2569,7 @@ class FuncGen:
         size = "1" if ci.elem == "bool" else "8"
         total = self.op(f"add i64 {self.op(f'mul i64 {nv}, {size}')}, 16")
         obj = self.op(f"call ptr @quill_alloc(i64 {total})")
-        self.fresh.add(obj)
+        self.fresh[obj] = "obj"
         self.emit(f'store ptr @"vtable.{ci.name}", ptr {obj}')
         self.emit(f"store i64 {nv}, ptr {self.op(f'getelementptr i8, ptr {obj}, i64 8')}")
         return obj, ci.name
@@ -2120,7 +2586,7 @@ class FuncGen:
             val = self.op(f"load {self.mod.llty(et)}, ptr {self.elem_ptr(ov, iv, et)}")
             if ov in self.fresh and self.is_ref(et):      # element of a temporary array
                 self.retain(val)
-                self.fresh.add(val)
+                self.fresh[val] = "str" if et == "str" else "obj"
             self.release_fresh(ov, ot)
             return val, et
         if not (self.mod.is_class(ot) and self.mod.find_method(self.mod.classes[ot], "get")):
@@ -2201,10 +2667,16 @@ class FuncGen:
                     vals.append(f"ptr {self.consume(v, t)}")   # ownership moves to the callee
                 else:
                     self.err(f"bad argument to {name}: {t}", a)
-            call = f"call {'i64' if ret == 'int' else 'void'} @{fn}({', '.join(vals)})"
+            call = f"call {'i64' if ret == 'int' else 'ptr' if ret == 'str' else 'void'} @{fn}({', '.join(vals)})"
+            if ret == "str":
+                r = self.op(call)
+                self.fresh[r] = "str"       # the runtime hands over an owned string
+                return r, "str"
             if ret == "int":
                 return self.op(call), "int"
             self.emit(call)
+            if fn == "quill_panic":
+                self.raise_pending()
             return None, "void"
         if name == "hash" and len(e.args) == 1:
             v, t = self.expr(e.args[0])
@@ -2226,7 +2698,7 @@ class FuncGen:
                 buf = self.op("call ptr @quill_alloc(i64 40)")
                 fmt, arg = ("%ld", f"i64 {v}") if t == "int" else ("%g", f"double {v}")
                 self.emit(f"call i32 (ptr, i64, ptr, ...) @snprintf(ptr {buf}, i64 40, ptr {self.mod.string(fmt)}, {arg})")
-                self.fresh.add(buf)
+                self.fresh[buf] = "str"
                 return buf, "str"
             if t == "bool":
                 return self.op(f"select i1 {v}, ptr {self.mod.string('true')}, ptr {self.mod.string('false')}"), "str"
@@ -2279,14 +2751,14 @@ class FuncGen:
         self.br(end)
         self.place(no)
         r, _ = self.call_method(v, t, "toString", [], node)
-        self.fresh.discard(r)
+        self.fresh.pop(r, None)
         self.emit(f"store ptr {r}, ptr {slot}")
         self.br(end)
         self.place(end)
         out = self.op(f"load ptr, ptr {slot}")
         # the object branch yields an owned string; the null branch an immortal literal
         # (immortal strings ignore release), so treat the result as fresh either way
-        self.fresh.add(out)
+        self.fresh[out] = "str"
         return out
 
     def print_(self, e):
@@ -2317,6 +2789,110 @@ class FuncGen:
 def compile_source(src):
     decls = Parser(lex(PRELUDE)).program() + Parser(lex(src)).program()
     return Module(decls).generate()
+
+
+def qualify(decls, ns, names):
+    """Rename the classes `names` to ns.NAME everywhere the declarations of an aliased
+    module mention them (types, `new`, static calls, instanceof, casts, catch)."""
+    mp = {n: f"{ns}.{n}" for n in names}
+
+    def ty(t):
+        weak = "weak " if t.startswith("weak ") else ""
+        base, args = parse_type(t[len(weak):])
+        base = mp.get(base, base)
+        return weak + (f"{base}[{','.join(ty(a) for a in args)}]" if args else base)
+
+    def walk(node):
+        if isinstance(node, list):
+            for x in node:
+                walk(x)
+            return
+        if not isinstance(node, N):
+            return
+        if isinstance(node, ClassDecl):
+            node.name = mp.get(node.name, node.name)
+            node.supers = [ty(t) for t in node.supers]
+        elif isinstance(node, (VarDecl, FieldDecl)):
+            node.type = ty(node.type)
+        elif isinstance(node, MethodDecl):
+            node.params = [(n, ty(t)) for n, t in node.params]
+            node.ret = ty(node.ret)
+        elif isinstance(node, (New, InstanceOf, Cast)):
+            attr = "cls"
+            setattr(node, attr, ty(getattr(node, attr)))
+        elif isinstance(node, Catch) and node.cls:
+            node.cls = ty(node.cls)
+        elif isinstance(node, FieldAccess) and isinstance(node.obj, Name) and node.obj.id in mp:
+            node.obj.id = mp[node.obj.id]          # Circle.make() inside the module
+        for f in dataclasses.fields(node):
+            walk(getattr(node, f.name))
+
+    walk(decls)
+
+
+def load_program(entry):
+    """Parse `entry` and every module it brings in; returns all class declarations.
+    Modules brought with `as NAME` (and the other modules of the same package they
+    bring) have their classes renamed NAME.Class."""
+    ctx = quillpkg.context_for(entry)
+    files, seen = [], {}                      # files: [(path, decls, namespace)]
+
+    def visit(path, pkg, ns, at=(None, 0)):
+        real = os.path.realpath(path)
+        if real in seen:
+            if seen[real] != ns:
+                was = f"as {seen[real]}" if seen[real] else "without a name"
+                now = f"as {ns}" if ns else "without a name"
+                raise CompileError(f"module {os.path.basename(path)} is brought {now}, but also {was} elsewhere",
+                                   at[1], at[0])
+            return
+        seen[real] = ns
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        try:
+            parser = Parser(lex(src))
+            found = parser.program()
+        except CompileError as e:
+            e.file = e.file or path
+            raise
+        for d in found:
+            d.file = path
+        files.append((path, found, ns))
+        for name, line, alias in parser.imports:
+            try:
+                target, tpkg = ctx.resolve(pkg, name)
+            except quillpkg.PackageError as e:
+                raise CompileError(str(e), line, path)
+            visit(target, tpkg, alias or (ns if tpkg is pkg else ""), (path, line))
+
+    visit(entry, ctx.package_of(entry), "")
+    spaces = {}
+    for _, found, ns in files:
+        if ns:
+            spaces.setdefault(ns, []).extend(d.name for d in found)
+    for path, found, ns in files:
+        if ns:
+            qualify(found, ns, spaces[ns])
+    decls, origin = [], {}
+    for path, found, ns in files:
+        for d in found:
+            if d.name in origin:
+                raise CompileError(f"class {d.name} is already defined in {origin[d.name]}", d.line, path)
+            origin[d.name] = path
+        decls.extend(found)
+    return decls, origin
+
+
+def compile_file(path):
+    prelude = Parser(lex(PRELUDE)).program()
+    for d in prelude:
+        d.file = "<built-in>"
+    decls, _ = load_program(path)
+    seen = {d.name for d in prelude}
+    for d in decls:
+        if d.name in seen:
+            raise CompileError(f"class {d.name} clashes with a built-in class", d.line, d.file)
+    return Module(prelude + decls).generate()
 
 
 def mark_sanitize(ir, kind):
@@ -2365,18 +2941,15 @@ def build_windows(ll, out, opt):
         exe = out if out.endswith(".exe") else out + ".exe"
         r = subprocess.run(["gcc", obj, shim, "-o", exe, "-lpthread"],
                            capture_output=True, text=True)
-        if r.returncode == 0 and exe != out:
-            os.replace(exe, out)
+        r.exe = exe
         return r
 
 
 def build(path, out, opt="-O1", keep_ll=False, sanitize=None):
-    with open(path) as f:
-        src = f.read()
     try:
-        ir = compile_source(src)
+        ir = compile_file(path)
     except CompileError as e:
-        print(f"{path}:{e.line}: error: {e.msg}", file=sys.stderr)
+        print(f"{e.file or path}:{e.line}: error: {e.msg}", file=sys.stderr)
         sys.exit(1)
     if sanitize:
         ir = mark_sanitize(ir, sanitize)
@@ -2397,31 +2970,80 @@ def build(path, out, opt="-O1", keep_ll=False, sanitize=None):
     if r.returncode:
         print("internal error: clang rejected generated IR\n" + r.stderr, file=sys.stderr)
         sys.exit(2)
+    return r.exe if hasattr(r, "exe") else out
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="quill")
-    ap.add_argument("cmd", choices=["run", "build", "emit"])
-    ap.add_argument("file")
-    ap.add_argument("-o", "--out")
-    ap.add_argument("-O", default="1", help="optimization level (0-3)")
-    ap.add_argument("--keep-ll", action="store_true")
-    ap.add_argument("--sanitize", choices=["address", "thread"],
-                    help="build with AddressSanitizer or ThreadSanitizer")
+    ap = argparse.ArgumentParser(prog="quill", description="The Quill compiler and package manager")
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="command")
+
+    def compiler_cmd(name, help_text):
+        sp = sub.add_parser(name, help=help_text)
+        sp.add_argument("file", nargs="?", help="a .ql file (default: the project's start module)")
+        sp.add_argument("-O", default="1", help="optimization level (0-3)")
+        return sp
+
+    san = dict(choices=["address", "thread"], help="build with AddressSanitizer or ThreadSanitizer")
+    sp = compiler_cmd("run", "compile and run a program")
+    sp.add_argument("--sanitize", **san)
+    sp = compiler_cmd("build", "compile to a native executable")
+    sp.add_argument("-o", "--out")
+    sp.add_argument("--keep-ll", action="store_true")
+    sp.add_argument("--sanitize", **san)
+    compiler_cmd("emit", "print the LLVM IR")
+
+    sp = sub.add_parser("new", help="create a project in a new folder")
+    sp.add_argument("name")
+    sp.add_argument("--lib", action="store_true", help="a library: no start module")
+    sp = sub.add_parser("init", help="create quill.pkg in the current folder")
+    sp.add_argument("--lib", action="store_true")
+    sp = sub.add_parser("install", help="resolve and fetch dependencies, write quill.lock")
+    sp.add_argument("--locked", action="store_true", help="fail instead of changing quill.lock")
+    sp.add_argument("--offline", action="store_true", help="use only what is already downloaded")
+    sp = sub.add_parser("update", help="re-resolve dependencies to newer versions")
+    sp.add_argument("names", nargs="*", help="only these packages (default: all)")
+    sp.add_argument("--offline", action="store_true")
+    sp = sub.add_parser("add", help="add a dependency")
+    sp.add_argument("name")
+    sp.add_argument("version", nargs="?", help="constraint: 1.4, =1.4.2, 1.2..2.0 or any")
+    sp.add_argument("--git", metavar="URL")
+    sp.add_argument("--path", metavar="DIR")
+    sp.add_argument("--branch")
+    sp.add_argument("--rev")
+    sp.add_argument("--tag")
+    sp.add_argument("--offline", action="store_true")
+    sp = sub.add_parser("drop", help="remove a dependency")
+    sp.add_argument("name")
+    sub.add_parser("tree", help="show the dependency tree")
     a = ap.parse_args()
-    if a.cmd == "emit":
-        try:
-            print(compile_source(open(a.file).read()))
-        except CompileError as e:
-            print(f"{a.file}:{e.line}: error: {e.msg}", file=sys.stderr)
-            sys.exit(1)
-    elif a.cmd == "build":
-        build(a.file, a.out or os.path.splitext(a.file)[0], f"-O{a.O}", a.keep_ll, a.sanitize)
-    else:
-        with tempfile.TemporaryDirectory() as d:
-            exe = os.path.join(d, "prog")
-            build(a.file, exe, f"-O{a.O}", sanitize=a.sanitize)
-            sys.exit(subprocess.run([exe]).returncode)
+
+    if a.cmd in ("new", "init", "install", "update", "add", "drop", "tree"):
+        sys.exit(quillpkg.cli(a.cmd, a))
+
+    try:
+        out_default = None
+        path = a.file
+        if path is None:
+            path, m = quillpkg.default_entry()
+            out_default = os.path.join(m.dir, "build", m.name)
+        if a.cmd == "emit":
+            try:
+                print(compile_file(path))
+            except CompileError as e:
+                print(f"{e.file or path}:{e.line}: error: {e.msg}", file=sys.stderr)
+                sys.exit(1)
+        elif a.cmd == "build":
+            out = a.out or out_default or os.path.splitext(path)[0]
+            os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+            exe = build(path, out, f"-O{a.O}", a.keep_ll, a.sanitize)
+            print(f"built {os.path.relpath(exe)}")
+        else:
+            with tempfile.TemporaryDirectory() as d:
+                exe = build(path, os.path.join(d, "prog"), f"-O{a.O}", sanitize=a.sanitize)
+                sys.exit(subprocess.run([exe]).returncode)
+    except quillpkg.PackageError as e:
+        print(f"quill: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
