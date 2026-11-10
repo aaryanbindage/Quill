@@ -3646,6 +3646,115 @@ def mark_sanitize(ir, kind):
     return re.sub(r"^(define [^\n]*) \{$", r"\1 " + attr + " {", ir, flags=re.M)
 
 
+def signed64(x):
+    return x - (1 << 64) if x >= 1 << 63 else x
+
+
+CHECK_ALIVE = signed64(0x51554C4C414C4956)
+CHECK_FREED = signed64(0x51554C4C46524545)
+CHECK_CANARY = signed64(0x51554C4C43414E52)
+CHECK_DEAD = signed64(0xDDDDDDDDDDDDDDDD)
+
+
+def add_checks(ir):
+    """The built-in memory checker (`--check`, and what `--sanitize address` means on Windows,
+    where the real AddressSanitizer is not available). It swaps the runtime's allocator for one
+    that keeps a canary after every block, remembers freed blocks (poisoned, never reused) and
+    reports a double free, a use after free, an overflow, or any object still alive at exit."""
+    alloc = f'''define ptr @quill_alloc(i64 %size) {{
+  %t = add i64 %size, 16
+  %n = add i64 %t, 32
+  %r = call ptr @calloc(i64 1, i64 %n)
+  store i64 %t, ptr %r
+  %mp = getelementptr i8, ptr %r, i64 8
+  store i64 {CHECK_ALIVE}, ptr %mp
+  %m = getelementptr i8, ptr %r, i64 16
+  %cp = getelementptr i8, ptr %m, i64 %t
+  store i64 {CHECK_CANARY}, ptr %cp
+  store i64 1, ptr %m
+  %w = getelementptr i8, ptr %m, i64 8
+  store i64 1, ptr %w
+  %o = atomicrmw add ptr @quill_live, i64 1 monotonic, align 8
+  %p = getelementptr i8, ptr %m, i64 16
+  ret ptr %p
+}}
+
+define void @quill_check_fail(ptr %msg) {{
+  %u = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.chk.fmt, ptr %msg)
+  call void @exit(i32 70)
+  unreachable
+}}
+
+define void @quill_probe(ptr %h) {{
+  %v = load i64, ptr %h
+  %dead = icmp eq i64 %v, {CHECK_DEAD}
+  br i1 %dead, label %bad, label %ok
+bad:
+  call void @quill_check_fail(ptr @.chk.uaf)
+  unreachable
+ok:
+  ret void
+}}
+
+define void @quill_free(ptr %hdr) {{
+  %mp = getelementptr i8, ptr %hdr, i64 -8
+  %magic = load i64, ptr %mp
+  %alive = icmp eq i64 %magic, {CHECK_ALIVE}
+  br i1 %alive, label %scan, label %notalive
+notalive:
+  %was = icmp eq i64 %magic, {CHECK_FREED}
+  br i1 %was, label %dbl, label %corrupt
+dbl:
+  call void @quill_check_fail(ptr @.chk.dbl)
+  unreachable
+corrupt:
+  call void @quill_check_fail(ptr @.chk.bad)
+  unreachable
+scan:
+  %sp = getelementptr i8, ptr %hdr, i64 -16
+  %size = load i64, ptr %sp
+  %cp = getelementptr i8, ptr %hdr, i64 %size
+  %c = load i64, ptr %cp
+  %fine = icmp eq i64 %c, {CHECK_CANARY}
+  br i1 %fine, label %kill, label %over
+over:
+  call void @quill_check_fail(ptr @.chk.over)
+  unreachable
+kill:
+  store i64 {CHECK_FREED}, ptr %mp
+  call void @llvm.memset.p0.i64(ptr %hdr, i8 221, i64 %size, i1 false)
+  %o = atomicrmw sub ptr @quill_live, i64 1 monotonic, align 8
+  ret void
+}}
+
+define void @quill_check_exit() {{
+  %live = load i64, ptr @quill_live
+  %any = icmp ne i64 %live, 0
+  br i1 %any, label %leak, label %done
+leak:
+  %u = call i32 (i32, ptr, ...) @dprintf(i32 2, ptr @.chk.leak, i64 %live)
+  br label %done
+done:
+  ret void
+}}
+
+@llvm.global_dtors = appending global [1 x {{ i32, ptr, ptr }}] [{{ i32, ptr, ptr }} {{ i32 65535, ptr @quill_check_exit, ptr null }}]
+'''
+    alloc += "\n".join([
+        cstr("@.chk.fmt", "quill check: %s\n"),
+        cstr("@.chk.leak", "quill check: %lld heap object(s) still alive at exit\n"),
+        cstr("@.chk.uaf", "use of freed memory (use after free, or a value released twice)"),
+        cstr("@.chk.dbl", "double free"),
+        cstr("@.chk.bad", "invalid free: the heap block header is corrupted"),
+        cstr("@.chk.over", "heap buffer overflow: something wrote past the end of an object or string"),
+    ]) + "\n"
+    ir, n = re.subn(r"define ptr @quill_alloc\(i64 %size\) \{.*?\n\}\n\ndefine void @quill_free\(ptr %hdr\) \{.*?\n\}\n",
+                    lambda m: alloc, ir, count=1, flags=re.S)
+    assert n == 1, "runtime layout changed; update add_checks"
+    probed = "  %h = getelementptr i8, ptr %p, i64 -16\n"
+    return ir.replace(probed, probed + "  call void @quill_probe(ptr %h)\n")
+
+
 WIN_SHIM = """#include <stdarg.h>
 #include <stdio.h>
 #include <io.h>
@@ -3717,7 +3826,7 @@ def build_windows(ll, out, opt, natives):
         return r
 
 
-def build(path, out, opt="-O1", keep_ll=False, sanitize=None, natives=None, hood=None):
+def build(path, out, opt="-O1", keep_ll=False, sanitize=None, natives=None, hood=None, check=False):
     natives = natives if natives is not None else NativeSpec()
     try:
         ir = compile_file(path, natives, hood)
@@ -3729,6 +3838,17 @@ def build(path, out, opt="-O1", keep_ll=False, sanitize=None, natives=None, hood
         print(f"note: native (C/C++) code is linked in via {names}. The compiler cannot check it; "
               "a wrong declaration can crash. See docs/native.md (silence with QUILL_QUIET_NATIVE=1).",
               file=sys.stderr)
+    if sanitize == "thread" and sys.platform == "win32":
+        print("error: ThreadSanitizer is not available on Windows (no thread checker exists for the "
+              "MinGW toolchain); guard shared state with a Mutex, or run the tests on Linux or macOS",
+              file=sys.stderr)
+        sys.exit(2)
+    if sanitize == "address" and sys.platform == "win32":
+        print("note: AddressSanitizer needs the MSVC toolchain, so on Windows --sanitize address uses "
+              "Quill's built-in memory checker instead (see docs/check.md)", file=sys.stderr)
+        sanitize, check = None, True
+    if check:
+        ir = add_checks(ir)
     if sanitize:
         ir = mark_sanitize(ir, sanitize)
     ll = out + ".ll" if keep_ll else tempfile.mktemp(suffix=".ll")
@@ -3736,9 +3856,6 @@ def build(path, out, opt="-O1", keep_ll=False, sanitize=None, natives=None, hood
         f.write(ir)
     flags = [f"-fsanitize={sanitize}", "-g"] if sanitize else []
     if sys.platform == "win32":
-        if sanitize:
-            print("error: --sanitize is not supported on Windows", file=sys.stderr)
-            sys.exit(2)
         r = build_windows(ll, out, opt, natives)
     else:
         r = run_tool(["clang++" if natives.cpp else "clang", opt, *flags, "-Wno-override-module", ll,
@@ -3762,12 +3879,15 @@ def main():
         return sp
 
     san = dict(choices=["address", "thread"], help="build with AddressSanitizer or ThreadSanitizer")
+    chk = dict(action="store_true", help="build with Quill's built-in memory checker (works everywhere, including Windows)")
     sp = compiler_cmd("run", "compile and run a program")
     sp.add_argument("--sanitize", **san)
+    sp.add_argument("--check", **chk)
     sp = compiler_cmd("build", "compile to a native executable")
     sp.add_argument("-o", "--out")
     sp.add_argument("--keep-ll", action="store_true")
     sp.add_argument("--sanitize", **san)
+    sp.add_argument("--check", **chk)
     compiler_cmd("emit", "print the LLVM IR")
 
     import quillwrap, quillhood
@@ -3820,11 +3940,11 @@ def main():
         elif a.cmd == "build":
             out = a.out or out_default or os.path.splitext(path)[0]
             os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-            exe = build(path, out, f"-O{a.O}", a.keep_ll, a.sanitize)
+            exe = build(path, out, f"-O{a.O}", a.keep_ll, a.sanitize, check=a.check)
             print(f"built {os.path.relpath(exe)}")
         else:
             with tempfile.TemporaryDirectory() as d:
-                exe = build(path, os.path.join(d, "prog"), f"-O{a.O}", sanitize=a.sanitize)
+                exe = build(path, os.path.join(d, "prog"), f"-O{a.O}", sanitize=a.sanitize, check=a.check)
                 sys.exit(subprocess.run([exe]).returncode)
     except quillpkg.PackageError as e:
         print(f"quill: {e}", file=sys.stderr)

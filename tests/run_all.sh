@@ -18,6 +18,30 @@ for san in "" $sans; do
   done
 done
 
+# the built-in memory checker: runs everywhere, and is what Windows uses instead of AddressSanitizer
+for t in tests/*.ql; do
+  out=$($PY quill.py run --check "$t" 2>&1); code=$?
+  if [ $code -ne 0 ] || echo "$out" | grep -qE '^LEAK|^quill check:'; then
+    echo "FAIL $t [check]"; echo "$out" | head -20; fail=1
+  else
+    echo "pass $t [check]"
+  fi
+done
+# the checker must catch a real leak, and `--sanitize address` must map to it on Windows
+printf 'class Node:
+    other: Node
+class Main:
+    static def main():
+        a = new Node()
+        a.other = a
+' > "${TMPDIR:-/tmp}/quill_leak.ql"
+if $PY quill.py run --check "${TMPDIR:-/tmp}/quill_leak.ql" 2>&1 | grep -q 'quill check: 1 heap object'; then
+  echo "pass check detects a leak"
+else
+  echo "FAIL check detects a leak"; fail=1
+fi
+rm -f "${TMPDIR:-/tmp}/quill_leak.ql"
+
 # compile-error tests: each file's first line is "# expect: <message fragment>"
 for t in tests/errors/*.ql; do
   want=$(head -1 "$t" | sed 's/^# expect: //')
