@@ -475,6 +475,7 @@ class CompileTests(Base):
         self.assertIn("ambiguous", cm.exception.msg)
 
     def test_templates(self):
+        self.addCleanup(os.chdir, os.getcwd())      # runs before the temp folder is deleted
         os.chdir(self.tmp)
         app = q.cmd_new("hello")
         lib = q.cmd_new("greeter", lib=True)
