@@ -1,0 +1,4 @@
+package mathx
+version 1.2.0
+about Tiny math helpers
+source src

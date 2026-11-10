@@ -21,7 +21,7 @@ class Main:
 - Strings use double quotes with escapes `\n \t \r \0 \\ \"`.
 - Keywords: `class def static return if elif else while for in new self true
   false null and or not break continue pass weak
-  public private abstract interface super instanceof as try catch throw`.
+  public private abstract interface super instanceof as try catch finally throw bring`.
 
 ## Types
 
@@ -500,6 +500,12 @@ A class that defines `def toString(self) -> str` is printed through it by
 Reading or writing a field, calling a method, indexing, or taking `len` of a
 `null` value stops the program with `error: null pointer dereference` and exit
 status 1 instead of crashing. Concatenating a `null` string is checked the same way.
+
+## Splitting a program: `bring`
+
+`bring util.text` at the top of a file loads `util/text.ql`, and `bring shapes`
+loads a package you depend on. Classes from brought files are used by their plain
+names. Details, and the package manager, are in [Modules and packages](packages.md).
 
 ## Exceptions
 

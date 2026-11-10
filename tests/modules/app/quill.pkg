@@ -1,0 +1,7 @@
+# a program that uses a local library, which has a dependency of its own
+package app
+version 0.1.0
+source src
+start main
+
+needs shapes 1.0 at path ../shapes

@@ -16,13 +16,15 @@ import struct
 import subprocess
 import sys
 import tempfile
+
+import quillpkg
 from dataclasses import dataclass, field
 
 
 class CompileError(Exception):
-    def __init__(self, msg, line=0):
+    def __init__(self, msg, line=0, file=None):
         super().__init__(msg)
-        self.msg, self.line = msg, line
+        self.msg, self.line, self.file = msg, line, file
 
 
 # ───────────────────────────── Lexer ─────────────────────────────
@@ -32,7 +34,7 @@ KEYWORDS = {
     "while", "for", "in", "new", "self", "true", "false", "null", "and",
     "or", "not", "break", "continue", "pass", "weak",
     "public", "private", "abstract", "interface", "super", "instanceof", "as",
-    "try", "catch", "finally", "throw",
+    "try", "catch", "finally", "throw", "bring",
 }
 
 TOKEN_RE = re.compile(r'''
@@ -247,9 +249,17 @@ class Parser:
 
     # program / classes
     def program(self):
-        classes = []
+        classes, self.imports = [], []         # imports: [(dotted module path, line)]
         while not self.is_("EOF"):
-            classes.append(self.class_decl())
+            if self.is_("KW", "bring"):
+                t = self.next()
+                path = [self.expect("NAME").val]
+                while self.accept("OP", "."):
+                    path.append(self.expect("NAME").val)
+                self.expect("NEWLINE")
+                self.imports.append((".".join(path), t.line))
+            else:
+                classes.append(self.class_decl())
         return classes
 
     def class_decl(self):
@@ -1326,26 +1336,42 @@ class Module:
 
         # every concrete class must implement all abstract and interface methods
         for ci in self.classes.values():
-            if ci.is_interface:
-                continue
-            line = ci.decl.line
-            if not ci.is_abstract:
-                for name in ci.vtable:
-                    impl = self.find_class_method(ci, name)
-                    if impl.abstract:
-                        raise CompileError(f"class {ci.name} must implement abstract method {impl.owner}.{name}", line)
-            for name, im in ci.required.items():
+            try:
+                self.check_complete(ci)
+            except CompileError as e:
+                if e.file is None:
+                    e.file = getattr(ci.decl, "file", None)
+                raise
+
+    def check_complete(self, ci):
+        if ci.is_interface:
+            return
+        line = ci.decl.line
+        if not ci.is_abstract:
+            for name in ci.vtable:
                 impl = self.find_class_method(ci, name)
-                if impl is None or impl.abstract or impl.static:
-                    if ci.is_abstract:
-                        continue
-                    raise CompileError(f"class {ci.name} does not implement {im.owner}.{name}", line)
-                if impl.access == "private":
-                    raise CompileError(f"{impl.owner}.{name} implements an interface method, so it cannot be private", impl.decl.line)
-                if impl.params != im.params or impl.ret != im.ret:
-                    raise CompileError(f"{impl.owner}.{name} has a different signature than interface method {im.owner}.{name}", impl.decl.line)
+                if impl.abstract:
+                    raise CompileError(f"class {ci.name} must implement abstract method {impl.owner}.{name}", line)
+        for name, im in ci.required.items():
+            impl = self.find_class_method(ci, name)
+            if impl is None or impl.abstract or impl.static:
+                if ci.is_abstract:
+                    continue
+                raise CompileError(f"class {ci.name} does not implement {im.owner}.{name}", line)
+            if impl.access == "private":
+                raise CompileError(f"{impl.owner}.{name} implements an interface method, so it cannot be private", impl.decl.line)
+            if impl.params != im.params or impl.ret != im.ret:
+                raise CompileError(f"{impl.owner}.{name} has a different signature than interface method {im.owner}.{name}", impl.decl.line)
 
     def build_class(self, ci, stack=()):
+        try:
+            self.build_class_body(ci, stack)
+        except CompileError as e:
+            if e.file is None:
+                e.file = getattr(ci.decl, "file", None)
+            raise
+
+    def build_class_body(self, ci, stack=()):
         if ci.name in self.built:
             return
         if ci.name in stack:
@@ -1710,7 +1736,7 @@ class FuncGen:
         return t
 
     def err(self, msg, node):
-        raise CompileError(msg, node.line)
+        raise CompileError(msg, node.line, getattr(self.ci.decl, "file", None))
 
     # ---- reference counting ----
     # Ownership model: locals/params own one reference. Expression results are
@@ -2697,6 +2723,53 @@ def compile_source(src):
     return Module(decls).generate()
 
 
+def load_program(entry):
+    """Parse `entry` and every module it brings in; returns all class declarations."""
+    ctx = quillpkg.context_for(entry)
+    decls, seen, origin = [], set(), {}
+
+    def visit(path, pkg):
+        real = os.path.realpath(path)
+        if real in seen:
+            return
+        seen.add(real)
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        try:
+            parser = Parser(lex(src))
+            found = parser.program()
+        except CompileError as e:
+            e.file = e.file or path
+            raise
+        for d in found:
+            d.file = path
+            if d.name in origin:
+                raise CompileError(f"class {d.name} is already defined in {origin[d.name]}", d.line, path)
+            origin[d.name] = path
+        decls.extend(found)
+        for name, line in parser.imports:
+            try:
+                target, tpkg = ctx.resolve(pkg, name)
+            except quillpkg.PackageError as e:
+                raise CompileError(str(e), line, path)
+            visit(target, tpkg)
+
+    visit(entry, ctx.package_of(entry))
+    return decls, origin
+
+
+def compile_file(path):
+    prelude = Parser(lex(PRELUDE)).program()
+    for d in prelude:
+        d.file = "<built-in>"
+    decls, _ = load_program(path)
+    seen = {d.name for d in prelude}
+    for d in decls:
+        if d.name in seen:
+            raise CompileError(f"class {d.name} clashes with a built-in class", d.line, d.file)
+    return Module(prelude + decls).generate()
+
+
 def mark_sanitize(ir, kind):
     """Sanitizers only instrument functions carrying this attribute (clang adds it
     for C source; raw .ll files need it added explicitly)."""
@@ -2743,18 +2816,15 @@ def build_windows(ll, out, opt):
         exe = out if out.endswith(".exe") else out + ".exe"
         r = subprocess.run(["gcc", obj, shim, "-o", exe, "-lpthread"],
                            capture_output=True, text=True)
-        if r.returncode == 0 and exe != out:
-            os.replace(exe, out)
+        r.exe = exe
         return r
 
 
 def build(path, out, opt="-O1", keep_ll=False, sanitize=None):
-    with open(path) as f:
-        src = f.read()
     try:
-        ir = compile_source(src)
+        ir = compile_file(path)
     except CompileError as e:
-        print(f"{path}:{e.line}: error: {e.msg}", file=sys.stderr)
+        print(f"{e.file or path}:{e.line}: error: {e.msg}", file=sys.stderr)
         sys.exit(1)
     if sanitize:
         ir = mark_sanitize(ir, sanitize)
@@ -2775,31 +2845,80 @@ def build(path, out, opt="-O1", keep_ll=False, sanitize=None):
     if r.returncode:
         print("internal error: clang rejected generated IR\n" + r.stderr, file=sys.stderr)
         sys.exit(2)
+    return r.exe if hasattr(r, "exe") else out
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="quill")
-    ap.add_argument("cmd", choices=["run", "build", "emit"])
-    ap.add_argument("file")
-    ap.add_argument("-o", "--out")
-    ap.add_argument("-O", default="1", help="optimization level (0-3)")
-    ap.add_argument("--keep-ll", action="store_true")
-    ap.add_argument("--sanitize", choices=["address", "thread"],
-                    help="build with AddressSanitizer or ThreadSanitizer")
+    ap = argparse.ArgumentParser(prog="quill", description="The Quill compiler and package manager")
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="command")
+
+    def compiler_cmd(name, help_text):
+        sp = sub.add_parser(name, help=help_text)
+        sp.add_argument("file", nargs="?", help="a .ql file (default: the project's start module)")
+        sp.add_argument("-O", default="1", help="optimization level (0-3)")
+        return sp
+
+    san = dict(choices=["address", "thread"], help="build with AddressSanitizer or ThreadSanitizer")
+    sp = compiler_cmd("run", "compile and run a program")
+    sp.add_argument("--sanitize", **san)
+    sp = compiler_cmd("build", "compile to a native executable")
+    sp.add_argument("-o", "--out")
+    sp.add_argument("--keep-ll", action="store_true")
+    sp.add_argument("--sanitize", **san)
+    compiler_cmd("emit", "print the LLVM IR")
+
+    sp = sub.add_parser("new", help="create a project in a new folder")
+    sp.add_argument("name")
+    sp.add_argument("--lib", action="store_true", help="a library: no start module")
+    sp = sub.add_parser("init", help="create quill.pkg in the current folder")
+    sp.add_argument("--lib", action="store_true")
+    sp = sub.add_parser("install", help="resolve and fetch dependencies, write quill.lock")
+    sp.add_argument("--locked", action="store_true", help="fail instead of changing quill.lock")
+    sp.add_argument("--offline", action="store_true", help="use only what is already downloaded")
+    sp = sub.add_parser("update", help="re-resolve dependencies to newer versions")
+    sp.add_argument("names", nargs="*", help="only these packages (default: all)")
+    sp.add_argument("--offline", action="store_true")
+    sp = sub.add_parser("add", help="add a dependency")
+    sp.add_argument("name")
+    sp.add_argument("version", nargs="?", help="constraint: 1.4, =1.4.2, 1.2..2.0 or any")
+    sp.add_argument("--git", metavar="URL")
+    sp.add_argument("--path", metavar="DIR")
+    sp.add_argument("--branch")
+    sp.add_argument("--rev")
+    sp.add_argument("--tag")
+    sp.add_argument("--offline", action="store_true")
+    sp = sub.add_parser("drop", help="remove a dependency")
+    sp.add_argument("name")
+    sub.add_parser("tree", help="show the dependency tree")
     a = ap.parse_args()
-    if a.cmd == "emit":
-        try:
-            print(compile_source(open(a.file).read()))
-        except CompileError as e:
-            print(f"{a.file}:{e.line}: error: {e.msg}", file=sys.stderr)
-            sys.exit(1)
-    elif a.cmd == "build":
-        build(a.file, a.out or os.path.splitext(a.file)[0], f"-O{a.O}", a.keep_ll, a.sanitize)
-    else:
-        with tempfile.TemporaryDirectory() as d:
-            exe = os.path.join(d, "prog")
-            build(a.file, exe, f"-O{a.O}", sanitize=a.sanitize)
-            sys.exit(subprocess.run([exe]).returncode)
+
+    if a.cmd in ("new", "init", "install", "update", "add", "drop", "tree"):
+        sys.exit(quillpkg.cli(a.cmd, a))
+
+    try:
+        out_default = None
+        path = a.file
+        if path is None:
+            path, m = quillpkg.default_entry()
+            out_default = os.path.join(m.dir, "build", m.name)
+        if a.cmd == "emit":
+            try:
+                print(compile_file(path))
+            except CompileError as e:
+                print(f"{e.file or path}:{e.line}: error: {e.msg}", file=sys.stderr)
+                sys.exit(1)
+        elif a.cmd == "build":
+            out = a.out or out_default or os.path.splitext(path)[0]
+            os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+            exe = build(path, out, f"-O{a.O}", a.keep_ll, a.sanitize)
+            print(f"built {os.path.relpath(exe)}")
+        else:
+            with tempfile.TemporaryDirectory() as d:
+                exe = build(path, os.path.join(d, "prog"), f"-O{a.O}", sanitize=a.sanitize)
+                sys.exit(subprocess.run([exe]).returncode)
+    except quillpkg.PackageError as e:
+        print(f"quill: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

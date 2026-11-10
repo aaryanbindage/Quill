@@ -20,7 +20,8 @@
 - **`weak` is limited** to class-typed fields and locals.
 - **No implicit `super()`.** A subclass `init` must call `super.init(...)` itself; the parent constructor does not run automatically.
 - **Missing return paths** in non-void methods silently return zero.
-- **Single file programs only.** There are no imports or modules.
+- **One global namespace.** `bring` loads other files and packages, but every class lives in the same namespace, so two modules cannot define the same class name and a package can only be used at one version per program. There is no way to import a single name or rename one.
+- **No package registry.** Packages are git repositories or local folders; there is no central index to search or publish to, and no signature checking beyond the lock file's hashes.
 - **Only `public` and `private`.** There is no `protected`, and no package or module level.
 - **Interface calls scan a table.** Dispatch through an interface is a linear search per call.
 - **Primitives are not objects.** `int`, `str` and the others have no methods.
@@ -38,6 +39,6 @@
    returns.
 6. Concurrency primitives: condition variables, atomic integers, channels,
    and thread results.
-7. A standard library and multi-file imports.
+7. A standard library, and namespaces for modules (so `bring shapes as s` and `s.Circle` work).
 8. Rewrite the compiler in Rust (or Quill itself) and link LLVM directly for
    better diagnostics and faster builds.

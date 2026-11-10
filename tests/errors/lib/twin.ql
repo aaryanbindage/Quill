@@ -1,0 +1,2 @@
+class Twin:
+    pass

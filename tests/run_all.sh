@@ -39,4 +39,20 @@ for t in tests/panics/*.ql; do
     echo "FAIL $t (wanted exit 1 and: $want; got exit $code)"; echo "$out" | head -3; fail=1
   fi
 done
+# a project made of three packages: the output must match expected.txt
+out=$($PY quill.py run tests/modules/app/src/main.ql 2>&1 | tr -d '\r')
+if [ "$out" = "$(cat tests/modules/app/expected.txt)" ]; then
+  echo "pass tests/modules/app"
+else
+  echo "FAIL tests/modules/app"; echo "$out" | head -5; fail=1
+fi
+
+# package manager unit tests (they build real git repositories in a temp folder)
+if command -v git >/dev/null 2>&1; then
+  if $PY -m unittest discover -s tests/pkg >/tmp/quill_pkg_tests.txt 2>&1; then
+    echo "pass tests/pkg"
+  else
+    echo "FAIL tests/pkg"; tail -20 /tmp/quill_pkg_tests.txt; fail=1
+  fi
+fi
 exit $fail
