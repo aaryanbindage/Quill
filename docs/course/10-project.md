@@ -213,4 +213,4 @@ page. When you run it yourself, you type them.)
 - Read the [language guide](../language-guide.md) for modules (`bring`), packages,
   threads, generics and calling C libraries.
 
-Congratulations: you have written a real program.
+Congratulations: you have written a real program. Lessons 11 to 14 go on to the standard library, drawing, generics and threads.

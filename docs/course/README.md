@@ -29,8 +29,12 @@ purpose is the fastest way to learn what the error messages mean.
 8. [Sharing behaviour](08-inheritance.md): inheritance, interfaces, `protected`
 9. [When things go wrong](09-errors.md): `try`, `catch`, `throw`
 10. [A small project](10-project.md): putting it all together
+11. [The standard library](11-stdlib.md): `bring`, math, random, statistics, hashing
+12. [Drawing in the terminal](12-art.md): colours, a canvas, big letters
+13. [Generics](13-generics.md): writing classes like `List[T]` yourself
+14. [Threads](14-threads.md): doing two things at once, and `Mutex`
 
-More lessons (modules and packages, threads, generics, C libraries, the memory checker)
+More lessons (your own modules and packages, calling C libraries, the memory checker)
 are planned; until they are written, the [language guide](../language-guide.md) covers them.
 
 ## How the course is checked

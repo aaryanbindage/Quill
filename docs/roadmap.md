@@ -25,13 +25,13 @@
 - **Only `public`, `protected` and `private`.** There is no package or module level.
 - **Interface calls scan a table.** Dispatch through an interface is a linear search per call.
 - **Basic types have a fixed set of methods.** `int`, `float`, `bool` and `str` have the methods listed in the language guide, but you cannot add your own, and they are not objects (they cannot be `null` except `str`, or stored where an object is expected).
-- **Collections are basic.** `List` has no slicing. `Map` and `Set` iteration order is unspecified, objects used as keys or set elements compare by identity, you cannot loop over a `Map` or `Set` directly (use `keys()`, `values()` or `items()`), and sets have no operators (`a.union(b)`, not `a | b`).
+- **Collections are basic.** `List` has no slicing. `Map` and `Set` iteration order is unspecified, objects used as keys or set elements compare by identity, `for k in map` and `for x in set` loop over a snapshot, and sets have no operators (`a.union(b)`, not `a | b`).
 - **Native code is unchecked.** `quill wrap` covers plain C and a simple C++ subset (no templates, STL containers, operators, callbacks, structs by value or output parameters), the compiler trusts the declared C signature, and `bring`/`needs` cannot fetch native libraries. See docs/native.md.
 - **Generics are template-style.** Every method of an instantiated generic is compiled for that type, there are no constraints on type parameters, no generic methods on ordinary classes, and no static calls on generic classes. Code size grows with the number of instantiations.
 
 ## Planned, in priority order
 
-1. Direct `Map` and `Set` iteration, list slicing, and generic methods.
+1. List slicing and generic methods.
 2. An explicit-stack drop to avoid deep recursion, and weak parameters and
    returns.
 3. Concurrency primitives: condition variables, atomic integers, channels,

@@ -359,7 +359,9 @@ for name in ages.keys():
 - **Iteration order is unspecified.** Sort or look up by key if you need order.
 - `keys()` and `values()` return copies, so changing the map while looping
   over them is safe; the loop just won't see the changes.
-- You cannot loop over a `Map` directly; loop over `m.keys()` or `m.values()`.
+- `for k in m:` loops over the keys and `for k, v in m:` over keys and values, both on a
+  snapshot taken when the loop starts (so removing entries inside the loop is safe). The
+  order is unspecified. To loop over the values alone use `m.values()`.
 
 ## List and map literals
 
@@ -415,7 +417,7 @@ a.items()   a.sortedItems()   a.copy()
 ```
 
 `add` and `remove` return whether the set changed. Iteration order is
-unspecified, so loop over `s.sortedItems()` when order matters. `{a, b}` is a
+unspecified, so loop over `s.sortedItems()` when order matters. `for x in s:` also works (on a snapshot). `{a, b}` is a
 set and `{k -> v}` is a map.
 
 ## Indexing and `for` loops

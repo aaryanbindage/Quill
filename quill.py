@@ -164,6 +164,8 @@ class SelfExpr(N): pass
 @dataclass
 class Name(N): id: str
 @dataclass
+class IterSource(N): e: N       # the thing after `in` of a for loop: a Map gives its keys, a Set its items
+@dataclass
 class Evaluated(N):           # an expression already compiled (the receiver of a method on a basic type)
     v: str
     t: str
@@ -454,10 +456,24 @@ class Parser:
             if kw == "for":
                 self.next()
                 var = self.expect("NAME").val
+                var2 = self.expect("NAME").val if self.accept("OP", ",") else None
                 self.expect("KW", "in")
+                if var2 is not None:
+                    # for k, v in m:  ->  $it = m; for $i in range(len(m.keys())): k = keys[$i]; v = $it.get(k); ...
+                    it = self.expr()
+                    body = self.block()
+                    self.fe += 1
+                    itn, keys, idx = f"$it{self.fe}", f"$keys{self.fe}", f"$i{self.fe}"
+                    nm = lambda n: Name(n, line=t.line)
+                    return [Block([Assign(nm(itn), it, line=t.line),
+                                   Assign(nm(keys), Call(FieldAccess(nm(itn), "keys", line=t.line), [], line=t.line), line=t.line),
+                                   ForRange(idx, IntLit(0, line=t.line), LenOf(nm(keys), line=t.line),
+                                            [Assign(nm(var), Index(nm(keys), nm(idx), line=t.line), line=t.line),
+                                             Assign(nm(var2), Call(FieldAccess(nm(itn), "get", line=t.line), [nm(var)], line=t.line), line=t.line)] + body,
+                                            line=t.line)], line=t.line)]
                 if not (self.is_("NAME", "range") and self.peek().val == "("):
                     # for x in xs:  ->  $it = xs; for $i in range(len): x = $it[$i]; ...
-                    it = self.expr()
+                    it = IterSource(self.expr(), line=t.line)
                     body = self.block()
                     self.fe += 1
                     itn, idx = f"$it{self.fe}", f"$i{self.fe}"
@@ -2790,6 +2806,14 @@ class FuncGen:
     # ---- expressions: each returns (llvm operand, quill type) ----
     def expr(self, e):
         return getattr(self, "e_" + type(e).__name__)(e)
+
+    def e_IterSource(self, e):
+        v, t = self.expr(e.e)
+        if t.startswith("Map[") and self.mod.is_class(t):
+            return self.call_method(v, t, "keys", [], e)
+        if t.startswith("Set[") and self.mod.is_class(t):
+            return self.call_method(v, t, "items", [], e)
+        return v, t
 
     def e_Evaluated(self, e):
         return e.v, e.t
