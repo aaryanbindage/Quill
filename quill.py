@@ -164,6 +164,10 @@ class SelfExpr(N): pass
 @dataclass
 class Name(N): id: str
 @dataclass
+class Evaluated(N):           # an expression already compiled (the receiver of a method on a basic type)
+    v: str
+    t: str
+@dataclass
 class Unary(N): op: str; e: N
 @dataclass
 class Binary(N): op: str; l: N; r: N
@@ -689,6 +693,7 @@ class Parser:
 
 PRIMS = {"int": "i64", "float": "double", "bool": "i1", "str": "ptr", "void": "void"}
 NUM = ("int", "float")
+PRIM_CLASS = {"int": "__Int", "float": "__Float", "bool": "__Bool", "str": "__Str"}
 
 
 def cstr(name, text):
@@ -2786,6 +2791,9 @@ class FuncGen:
     def expr(self, e):
         return getattr(self, "e_" + type(e).__name__)(e)
 
+    def e_Evaluated(self, e):
+        return e.v, e.t
+
     def expr_want(self, e, want):
         """Evaluate e; a list or map literal takes its element types from `want`."""
         if want is not None and isinstance(e, (ListLit, MapLit, SetLit)):
@@ -3211,6 +3219,12 @@ class FuncGen:
             self.check_access(mi, e)
             return self.call_args(mi, None, e.args, e)
         ov, ot = self.expr(c.obj)
+        if ot in PRIM_CLASS:
+            # methods on basic types are static methods of a built-in class taking the value first
+            mi = self.mod.find_class_method(self.mod.classes[PRIM_CLASS[ot]], c.name)
+            if not mi or not mi.static:
+                self.err(f"{ot} has no method {c.name}", e)
+            return self.call_args(mi, None, [Evaluated(ov, ot, line=e.line)] + e.args, e)
         return self.call_method(ov, ot, c.name, e.args, e)
 
     def call_method(self, ov, ot, name, args, node):
@@ -3678,6 +3692,8 @@ def compile_file(path, natives=None, hood=None):
     """Compile a program to LLVM IR text. `natives` (a NativeSpec) collects what the
     program needs from C; `hood` (a dict) collects internals for `quill hood`."""
     prelude = Parser(lex(PRELUDE)).program()
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "std", "primitives.ql"), encoding="utf-8") as f:
+        prelude += Parser(lex(f.read())).program()
     for d in prelude:
         d.file = "<built-in>"
     decls, origin = load_program(path, natives, hood.setdefault("modules", []) if hood is not None else None)

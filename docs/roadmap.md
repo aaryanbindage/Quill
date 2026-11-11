@@ -24,19 +24,19 @@
 - **No package registry.** Packages are git repositories or local folders; there is no central index to search or publish to, and no signature checking beyond the lock file's hashes.
 - **Only `public`, `protected` and `private`.** There is no package or module level.
 - **Interface calls scan a table.** Dispatch through an interface is a linear search per call.
-- **Primitives are not objects.** `int`, `str` and the others have no methods.
+- **Basic types have a fixed set of methods.** `int`, `float`, `bool` and `str` have the methods listed in the language guide, but you cannot add your own, and they are not objects (they cannot be `null` except `str`, or stored where an object is expected).
 - **Collections are basic.** `List` has no slicing. `Map` and `Set` iteration order is unspecified, objects used as keys or set elements compare by identity, you cannot loop over a `Map` or `Set` directly (use `keys()`, `values()` or `items()`), and sets have no operators (`a.union(b)`, not `a | b`).
 - **Native code is unchecked.** `quill wrap` covers plain C and a simple C++ subset (no templates, STL containers, operators, callbacks, structs by value or output parameters), the compiler trusts the declared C signature, and `bring`/`needs` cannot fetch native libraries. See docs/native.md.
 - **Generics are template-style.** Every method of an instantiated generic is compiled for that type, there are no constraints on type parameters, no generic methods on ordinary classes, and no static calls on generic classes. Code size grows with the number of instantiations.
 
 ## Planned, in priority order
 
-1. Primitives as objects with methods (`"hi".upper()`, `x.toString()`).
-2. Direct `Map` and `Set` iteration, list slicing, and generic methods.
-3. An explicit-stack drop to avoid deep recursion, and weak parameters and
+1. Direct `Map` and `Set` iteration, list slicing, and generic methods.
+2. An explicit-stack drop to avoid deep recursion, and weak parameters and
    returns.
-4. Concurrency primitives: condition variables, atomic integers, channels,
+3. Concurrency primitives: condition variables, atomic integers, channels,
    and thread results.
-5. More standard library, per-file module aliases, and several versions of one package in a program.
+4. More standard library, per-file module aliases, and several versions of one package in a program.
+5. More course lessons (modules and packages, threads, generics, C libraries).
 6. Rewrite the compiler in Rust (or Quill itself) and link LLVM directly for
    better diagnostics and faster builds.

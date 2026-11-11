@@ -54,6 +54,7 @@ git repositories (versions are tags) or local folders.
 
 ## Docs
 
+- [Learn Quill](docs/course/README.md): a ten-lesson course for beginners, every program checked by the test suite
 - [Language guide](docs/language-guide.md): syntax, types, classes, weak
   references, threads, generics, `List` and `Map`, built-ins
 - [Compiler internals](docs/internals.md): pipeline, object layout, vtables,

@@ -430,6 +430,31 @@ set and `{k -> v}` is a map.
   once, and its length is fixed when the loop starts. `break`, `continue` and
   `return` work normally. `range` loops are unchanged.
 
+## Methods on basic types
+
+`int`, `float`, `bool` and `str` values have methods, written `value.method(...)`. They
+never change the value; they return a new one. Write a number literal in brackets before
+the dot if the parser could mistake it for a decimal point: `(5).toHex()` also works as `5.toHex()`.
+Calling a method on a `null` string stops with an error.
+
+| Type | Methods |
+|---|---|
+| `str` | `length() isEmpty() upper() lower() capitalize() trim() indexOf(s) contains(s) startsWith(s) endsWith(s) count(s) substring(start, end) charAt(i) byteAt(i) replace(old, new) split(sep) lines() repeat(n) reverse() padLeft(width, ch) padRight(width, ch) toInt() toFloat() toString()` and `sep.join(list)` |
+| `int` | `toString() toFloat() abs() sign() min(o) max(o) clamp(lo, hi) isEven() isOdd() pow(e) toHex() toBinary()` |
+| `float` | `toString() toInt() floor() ceil() round() abs() sign() min(o) max(o) clamp(lo, hi) isNaN()` |
+| `bool` | `toString()` |
+
+Notes: `substring(start, end)` excludes `end`; `indexOf` gives -1 when not found;
+`split("")` gives one piece per character; `float.floor/ceil/round` return an `int` (halves
+round away from zero) and throw when the value does not fit; `toInt()` and `toFloat()` on
+strings throw an `Error` for text that is not a number, and `toFloat()` is close to exact but
+not always correctly rounded in the last digit. Strings are bytes, so `upper` and `lower` only
+change the letters A to Z.
+
+These are ordinary static methods of built-in classes named `__Str`, `__Int`, `__Float` and
+`__Bool` (see `std/primitives.ql`); the compiler rewrites `s.upper()` to `__Str.upper(s)`.
+You cannot add methods of your own to basic types.
+
 ## Built-in functions
 
 | Call           | Result                                              |

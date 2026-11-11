@@ -50,6 +50,13 @@ else
   echo "FAIL tests/stdin/read.ql"; echo "$out"; fail=1
 fi
 
+# the course: every program in docs/course runs and prints what the lesson says
+if $PY tests/course_check.py > "${TMPDIR:-/tmp}/quill_course.txt" 2>&1; then
+  echo "pass docs/course"
+else
+  echo "FAIL docs/course"; cat "${TMPDIR:-/tmp}/quill_course.txt"; fail=1
+fi
+
 # compile-error tests: each file's first line is "# expect: <message fragment>"
 for t in tests/errors/*.ql; do
   want=$(head -1 "$t" | sed 's/^# expect: //')
