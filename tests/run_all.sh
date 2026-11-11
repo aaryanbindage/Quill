@@ -9,7 +9,7 @@ case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) sans="" ;; *) sans=" address thread"
 for san in "" $sans; do
   for t in tests/*.ql; do
     if [ -n "$san" ]; then flag="--sanitize $san"; else flag=""; fi
-    out=$(ASAN_OPTIONS=detect_leaks=0 $PY quill.py run $flag "$t" 2>&1); code=$?
+    out=$(ASAN_OPTIONS=detect_leaks=0 $PY quill.py run $flag "$t" 2>&1 </dev/null); code=$?
     if [ $code -ne 0 ] || echo "$out" | grep -qE '^LEAK|ERROR: AddressSanitizer|WARNING: ThreadSanitizer'; then
       echo "FAIL $t [${san:-plain}]"; echo "$out" | head -20; fail=1
     else
@@ -20,7 +20,7 @@ done
 
 # the built-in memory checker: runs everywhere, and is what Windows uses instead of AddressSanitizer
 for t in tests/*.ql; do
-  out=$($PY quill.py run --check "$t" 2>&1); code=$?
+  out=$($PY quill.py run --check "$t" 2>&1 </dev/null); code=$?
   if [ $code -ne 0 ] || echo "$out" | grep -qE '^LEAK|^quill check:'; then
     echo "FAIL $t [check]"; echo "$out" | head -20; fail=1
   else
@@ -41,6 +41,14 @@ else
   echo "FAIL check detects a leak"; fail=1
 fi
 rm -f "${TMPDIR:-/tmp}/quill_leak.ql"
+
+# console input: the program reads lines from standard input
+out=$(printf 'hello world\r\nsecond\n' | $PY quill.py run tests/stdin/read.ql 2>&1)
+if [ "$(echo "$out" | grep -c '^ok')" = 3 ] && ! echo "$out" | grep -q 'FAIL\|LEAK'; then
+  echo "pass tests/stdin/read.ql"
+else
+  echo "FAIL tests/stdin/read.ql"; echo "$out"; fail=1
+fi
 
 # compile-error tests: each file's first line is "# expect: <message fragment>"
 for t in tests/errors/*.ql; do

@@ -62,6 +62,7 @@ git repositories (versions are tags) or local folders.
   constraints, the lock file and every package command
 - [Standard library](docs/stdlib.md): `std.math`, `std.random`, `std.stats`,
   hashing and encryption (`std.hash`, `std.cipher`, `std.crypto`)
+- [Console and text art](docs/console-art.md): `std.console` (colours, cursor, input) and `std.art` (canvas, banners)
 - [C and C++ libraries](docs/native.md): `quill wrap`, `native` methods, `Buffer`, and the caveats
 - [Under the hood](docs/hood.md): `quill hood` shows layouts, reference counting, native calls and build commands
 - [Memory checker](docs/check.md): `--check`, leak, double-free and overflow detection on every platform
