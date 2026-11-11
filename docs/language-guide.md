@@ -21,7 +21,7 @@ class Main:
 - Strings use double quotes with escapes `\n \t \r \0 \\ \"`.
 - Keywords: `class def static return if elif else while for in new self true
   false null and or xor not break continue pass weak
-  public private abstract interface super instanceof as try catch finally throw bring`.
+  public private protected abstract interface super instanceof as try catch finally throw bring`.
 
 ## Types
 
@@ -153,10 +153,10 @@ class Dog < Animal:
   may have different parameters. It does not call the parent `init`
   automatically; call `super.init(...)` yourself (see `super` below).
 
-## Access control: `public` and `private`
+## Access control: `public`, `protected` and `private`
 
-Fields and methods (including `init`) are `public` unless marked `private`.
-Put the modifier first:
+Fields and methods (including `init`) are `public` unless marked `private` or
+`protected`. Put the modifier first:
 
 ```python
 class Account:
@@ -174,6 +174,12 @@ class Account:
 - Private methods are **not virtual**: a subclass method with the same name is
   a separate method and does not override. A subclass cannot give a public
   method the same name with `private` (that would reduce visibility).
+- A `protected` member can be used in the declaring class and in its subclasses,
+  and nowhere else. Protected methods are inherited and virtual, like public ones;
+  an overriding method may stay protected or become public, but cannot turn a public
+  method into a protected one. A protected `init` lets subclasses call `super.init`
+  while `new` stays limited to the class and its subclasses.
+- An interface method that a class implements must be public.
 
 ## Abstract classes
 
@@ -206,13 +212,16 @@ class Circle < Shape, Greeter:              # one class, any number of interface
     def greet(self) -> str: ...
 ```
 
-- An interface has only public, non-static method signatures: no fields,
-  bodies, `init` or `deinit`.
+- An interface has only public, non-static methods: no fields, `init` or `deinit`.
+  A method with a body is a **default method**: classes that do not define it
+  inherit the default, and the body can call the interface's other methods through
+  `self`. If a class gets two different defaults of one name from two interfaces it
+  must define the method itself.
 - After `<`, a class lists at most one superclass and any number of
   interfaces, in any order.
 - A concrete class must implement every method of every interface it
   promises (directly or inherited). Signatures must match exactly, and the
-  implementing method cannot be private.
+  implementing method must be public.
 - An interface name is a type. A `Circle` can be stored in a `Named`
   variable, passed as a `Named` parameter, and so on. Through that type you
   can call only the interface's methods.

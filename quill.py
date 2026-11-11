@@ -37,7 +37,7 @@ KEYWORDS = {
     "class", "def", "static", "return", "if", "elif", "else",
     "while", "for", "in", "new", "self", "true", "false", "null", "and",
     "or", "xor", "not", "break", "continue", "pass", "weak",
-    "public", "private", "abstract", "interface", "super", "instanceof", "as",
+    "public", "private", "protected", "abstract", "interface", "super", "instanceof", "as",
     "try", "catch", "finally", "throw", "bring",
 }
 
@@ -322,10 +322,10 @@ class Parser:
                 self.expect("NEWLINE")
                 continue
             line, mods = self.tok.line, {}
-            while (self.is_("KW") and self.tok.val in ("public", "private", "static", "abstract")) or \
+            while (self.is_("KW") and self.tok.val in ("public", "private", "protected", "static", "abstract")) or \
                     (self.is_("NAME", "native") and self.peek().kind == "KW"):
                 m = self.next().val
-                key = "access" if m in ("public", "private") else m
+                key = "access" if m in ("public", "private", "protected") else m
                 if key in mods:
                     raise CompileError(f"duplicate modifier {m}", line)
                 mods[key] = m if key == "access" else True
@@ -374,6 +374,8 @@ class Parser:
                 break
         self.expect("OP", ")")
         ret = self.type_name() if self.accept("OP", "->") else "void"
+        if in_interface and not mods.get("abstract") and self.is_("OP", ":"):
+            abstract = False                      # an interface method with a body is a default
         if mods.get("native"):
             if not static or abstract or in_interface:
                 raise CompileError("native methods must be static", t.line)
@@ -1830,6 +1832,7 @@ class ClassInfo:
     field_info: dict = field(default_factory=dict)  # field -> (owner, access)
     required: dict = field(default_factory=dict)  # interface method name -> MethodInfo
     elem: str = None                              # element type, for built-in Array[T]
+    ambiguous: set = field(default_factory=set)   # interface methods with two different defaults
 
     @property
     def is_interface(self):
@@ -1895,12 +1898,16 @@ class Module:
                     raise CompileError(f"class {ci.name} must implement abstract method {impl.owner}.{name}", line)
         for name, im in ci.required.items():
             impl = self.find_class_method(ci, name)
+            if impl is None and not im.abstract:
+                if name in ci.ambiguous:
+                    raise CompileError(f"class {ci.name} inherits two default versions of {name} from different interfaces; define {name} in {ci.name}", line)
+                continue                          # the interface's default method is used
             if impl is None or impl.abstract or impl.static:
                 if ci.is_abstract:
                     continue
                 raise CompileError(f"class {ci.name} does not implement {im.owner}.{name}", line)
-            if impl.access == "private":
-                raise CompileError(f"{impl.owner}.{name} implements an interface method, so it cannot be private", impl.decl.line)
+            if impl.access != "public":
+                raise CompileError(f"{impl.owner}.{name} implements an interface method, so it cannot be {impl.access}", impl.decl.line)
             if impl.params != im.params or impl.ret != im.ret:
                 raise CompileError(f"{impl.owner}.{name} has a different signature than interface method {im.owner}.{name}", impl.decl.line)
 
@@ -1938,11 +1945,16 @@ class Module:
             ci.field_info = dict(ci.parent.field_info)
             ci.vtable = list(ci.parent.vtable)
             ci.required = dict(ci.parent.required)
+            ci.ambiguous = set(ci.parent.ambiguous)
         for i in ifaces:
             for n, im in i.required.items():
                 old = ci.required.get(n)
                 if old and (old.params != im.params or old.ret != im.ret):
                     raise CompileError(f"conflicting signatures for interface method {n}", d.line)
+                if old and old is not im and not old.abstract and not im.abstract:
+                    ci.ambiguous.add(n)           # two different defaults: the class must choose
+                if old and not old.abstract and im.abstract:
+                    continue                      # a default satisfies a plain requirement
                 ci.required[n] = im
         if d.interface and d.fields:
             raise CompileError("interfaces cannot have fields", d.line)
@@ -1968,7 +1980,7 @@ class Module:
                 raise CompileError(f"abstract method {m.name} in non-abstract class {ci.name}", m.line)
             if m.abstract and (m.static or m.access == "private"):
                 raise CompileError("abstract methods cannot be static or private", m.line)
-            if d.interface and (m.name in ("init", "deinit") or m.access == "private"):
+            if d.interface and (m.name in ("init", "deinit") or m.access != "public"):
                 raise CompileError("interfaces can only declare public instance methods", m.line)
             mi = MethodInfo(m.name, ci.name, m.params, m.ret, m.static, m,
                             m.access, m.abstract, d.interface)
@@ -1990,6 +2002,8 @@ class Module:
                     raise CompileError(f"{ci.name}.{m.name} cannot reduce the visibility of the method it overrides", m.line)
                 continue               # private methods are non-virtual
             if prev:
+                if m.access == "protected" and prev.access == "public":
+                    raise CompileError(f"{ci.name}.{m.name} cannot reduce the visibility of the method it overrides", m.line)
                 if prev.static or prev.params != m.params or prev.ret != m.ret:
                     raise CompileError(f"{ci.name}.{m.name} has a different signature than the method it overrides", m.line)
             elif m.name not in ci.vtable:
@@ -2192,7 +2206,7 @@ done:
             out.append(f'%"{ci.name}" = type {{ {body} }}')
         for ci in concrete:
             # vtable: [drop, itable, methods...]; itable: [{method id, fn}..., {-1, null}]
-            entries = [f'{{ i64, ptr }} {{ i64 {self.iface_ids[n]}, ptr {self.find_class_method(ci, n).symbol} }}'
+            entries = [f'{{ i64, ptr }} {{ i64 {self.iface_ids[n]}, ptr {(self.find_class_method(ci, n) or ci.required[n]).symbol} }}'
                        for n in ci.required]
             entries.append("{ i64, ptr } { i64 -1, ptr null }")
             out.append(f'@"itable.{ci.name}" = constant [{len(entries)} x {{ i64, ptr }}] [{", ".join(entries)}]')
@@ -3088,8 +3102,8 @@ class FuncGen:
         for i, (n, t) in enumerate(ci.fields):
             if n == e.name:
                 owner, access = ci.field_info[n]
-                if access == "private" and self.ci.name != owner:
-                    self.err(f"field {n} is private to {owner}", e)
+                if not self.can_see(access, owner):
+                    self.err(f"field {n} is {self.denied(access, owner)}", e)
                 return self.op(f'getelementptr %"{ot}", ptr {ov}, i32 0, i32 {i + 1}'), t, ov, ot
         self.err(f"class {ot} has no field {e.name}", e)
 
@@ -3127,8 +3141,8 @@ class FuncGen:
         self.emit(f'store ptr @"vtable.{ci.name}", ptr {obj}')
         init = self.mod.find_class_method(ci, "init")
         if init:
-            if init.access == "private" and self.ci.name != init.owner:
-                self.err(f"constructor of {ci.name} is private", e)
+            if not self.can_see(init.access, init.owner):
+                self.err(f"constructor of {ci.name} is {init.access}", e)
             self.call_args(init, obj, e.args, e)
         elif e.args:
             self.err(f"class {ci.name} has no init, but arguments were given", e)
@@ -3320,9 +3334,19 @@ class FuncGen:
             self.err(f"cannot iterate over {t} (it needs size() and get(i))", e)
         return self.expr(Call(FieldAccess(e.e, "size", line=e.line), [], line=e.line))
 
+    def can_see(self, access, owner):
+        """private: only the declaring class; protected: it and its subclasses."""
+        if access == "public" or self.ci.name == owner:
+            return True
+        return access == "protected" and self.mod.is_subclass(self.ci.name, owner)
+
+    @staticmethod
+    def denied(access, owner):
+        return f"private to {owner}" if access == "private" else f"protected in {owner} (only {owner} and its subclasses can use it)"
+
     def check_access(self, mi, node):
-        if mi.access == "private" and self.ci.name != mi.owner:
-            self.err(f"method {mi.name} is private to {mi.owner}", node)
+        if not self.can_see(mi.access, mi.owner):
+            self.err(f"method {mi.name} is {self.denied(mi.access, mi.owner)}", node)
 
     def e_SuperCall(self, e):
         if self.mi.static:
@@ -3439,7 +3463,7 @@ class FuncGen:
             return False
         mi = self.mod.find_method(self.mod.classes[t], "toString")
         return bool(mi and not mi.static and not mi.params and mi.ret == "str"
-                    and (mi.access != "private" or self.ci.name == mi.owner))
+                    and self.can_see(mi.access, mi.owner))
 
     def print_to_string(self, v, t, pf, node):
         """Print an object through its toString(), or <null> when it is null."""
