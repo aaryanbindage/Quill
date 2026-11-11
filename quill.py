@@ -705,6 +705,10 @@ INTRINSICS = {
     "__mutex_unlock": (["int"], "void", "quill_mutex_unlock"),
     "__mutex_free": (["int"], "void", "quill_mutex_free"),
     "__sleep_ms": (["int"], "void", "quill_sleep_ms"),
+    "__write": (["str"], "void", "quill_write"),
+    "__flush": ([], "void", "quill_flush"),
+    "__getc": ([], "int", "quill_getc"),
+    "__console_init": ([], "void", "quill_console_init"),
     "__panic": (["str"], "void", "quill_panic"),
     "__exc_msg": ([], "str", "quill_exc_msg"),
     "__str_alloc": (["int"], "str", "quill_str_alloc"),
@@ -1178,6 +1182,8 @@ declare i32 @printf(ptr, ...)
 declare i64 @strlen(ptr)
 declare i32 @strcmp(ptr, ptr)
 declare i32 @snprintf(ptr, i64, ptr, ...)
+declare i32 @fflush(ptr)
+declare i32 @getchar()
 declare ptr @calloc(i64, i64)
 declare void @free(ptr)
 declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
@@ -1583,6 +1589,28 @@ define void @quill_mutex_free(i64 %h) {
   ret void
 }
 
+; console: raw text without a newline, flushing, reading one byte of stdin
+define void @quill_write(ptr %s) {
+  %r = call i32 (ptr, ...) @printf(ptr @.fmt.raw, ptr %s)
+  ret void
+}
+
+define void @quill_flush() {
+  %r = call i32 @fflush(ptr null)
+  ret void
+}
+
+define i64 @quill_getc() {
+  %c = call i32 @getchar()
+  %w = sext i32 %c to i64
+  ret i64 %w
+}
+
+; Windows replaces this with a version that switches the console to ANSI colours and UTF-8
+define void @quill_console_init() {
+  ret void
+}
+
 define void @quill_sleep_ms(i64 %ms) {
   %us = mul i64 %ms, 1000
   %t = trunc i64 %us to i32
@@ -1594,7 +1622,8 @@ define void @quill_sleep_ms(i64 %ms) {
 RUNTIME += "\n" + cstr("@.fmt.panic", "error: %s\n") + "\n" + \
     cstr("@.fmt.index", "index %lld out of range (length %lld)") + "\n" + \
     cstr("@.fmt.uncaught", "error: uncaught exception: %s\n") + "\n" + \
-    cstr("@.fmt.uncaught0", "error: uncaught exception\n") + "\n"
+    cstr("@.fmt.uncaught0", "error: uncaught exception\n") + "\n" + \
+    cstr("@.fmt.raw", "%s") + "\n"
 
 
 def split_top(s):
@@ -3765,6 +3794,12 @@ int getentropy(void *buf, size_t n) {
     rtl_gen_random fn = (rtl_gen_random)GetProcAddress(LoadLibraryA("advapi32.dll"), "SystemFunction036");
     return fn && fn(buf, (ULONG)n) ? 0 : -1;
 }
+void quill_console_init(void) {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode;
+    if (GetConsoleMode(h, &mode)) SetConsoleMode(h, mode | 0x0004);
+    SetConsoleOutputCP(65001);
+}
 int dprintf(int fd, const char *fmt, ...) {
     char buf[1024];
     va_list ap; va_start(ap, fmt);
@@ -3847,6 +3882,8 @@ def build(path, out, opt="-O1", keep_ll=False, sanitize=None, natives=None, hood
         print("note: AddressSanitizer needs the MSVC toolchain, so on Windows --sanitize address uses "
               "Quill's built-in memory checker instead (see docs/check.md)", file=sys.stderr)
         sanitize, check = None, True
+    if sys.platform == "win32":
+        ir = ir.replace("define void @quill_console_init() {\n  ret void\n}\n", "declare void @quill_console_init()\n")
     if check:
         ir = add_checks(ir)
     if sanitize:
